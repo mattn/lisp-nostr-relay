@@ -477,7 +477,8 @@
                    (error (e)
                      (format t "Error serving file for path ~A: ~A~%" path e)
                      (force-output)
-                     '(400 () ("Bad Request"))))))))))
+                     '(400 () ("Bad Request"))))))))
+      (error (e)
         (format t "ERROR in app handler: ~A~%~A~%" e 
                 (with-output-to-string (s)
                   (sb-debug:print-backtrace :stream s :count 20)))
