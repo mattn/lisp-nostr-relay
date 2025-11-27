@@ -12,7 +12,7 @@
         (load target)
         (error nil "Quicklisp setup.lisp が見つかりません。 ~/.quicklisp/, ~/.roswell/, ~/.ros/ を確認してください。"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :lack :jonathan :postmodern :ironclad :babel) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :jonathan :postmodern :ironclad :babel :alexandria) :silent t)
 
 (in-package :cl-user)
 (defpackage nostr-relay
@@ -416,6 +416,8 @@
     (error (e)
       (format t "Error processing message: ~A~%" e))))
 
+(defvar *public-path* nil)
+
 (defvar *app*
   (lambda (env)
     (let ((upgrade (gethash "upgrade" (getf env :headers)))
@@ -447,41 +449,26 @@
             ((and accept (search "application/nostr+json" accept))
              '(200 (:content-type "application/nostr+json")
                ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}")))
-            ;; Redirect / to /index.html
-            ((string= path "/")
-             (format t "Redirecting / to /index.html~%")
-             '(301 (:location "/index.html") ()))
-            ;; Not found
+            ;; Static files
             (t
-             (format t "Not found: ~A~%" path)
-             '(404 () ("Not Found"))))))))
-
-(defun plist-set (plist key value)
-  "Set a key-value pair in a plist"
-  (let ((result (copy-list plist)))
-    (setf (getf result key) value)
-    result))
+             (let* ((file-path (if (string= path "/")
+                                   (merge-pathnames "index.html" *public-path*)
+                                   (merge-pathnames (string-left-trim "/" path) *public-path*))))
+               (if (probe-file file-path)
+                   (let ((content (alexandria:read-file-into-byte-vector file-path))
+                         (content-type (hunchentoot:mime-type file-path)))
+                     (list 200 (list :content-type content-type) content))
+                   '(404 () ("Not Found")))))))))) 
 
 (defun main ()
   ;; Database initialization and server startup
   (initialize)
   (connect-db)
-  (let ((public-path (merge-pathnames "public/" 
-                                      (or *load-pathname* 
-                                          *compile-file-pathname*
-                                          (truename ".")
-                                          #p"/app/"))))
-    (format t "Static files path: ~A~%" public-path)
-    (clack:clackup 
-     (lack:builder
-      ;; Rewrite / to /index.html
-      (lambda (app)
-        (lambda (env)
-          (let ((path (getf env :path-info)))
-            (if (string= path "/")
-                (funcall app (plist-set env :path-info "/index.html"))
-                (funcall app env)))))
-      (:static :path "/" :root public-path)
-      *app*)
-     :server *handler* :port 5000 :use-thread nil)))
+  (setf *public-path* (merge-pathnames "public/" 
+                                       (or *load-pathname* 
+                                           *compile-file-pathname*
+                                           (truename ".")
+                                           #p"/app/")))
+  (format t "Static files path: ~A~%" *public-path*)
+  (clack:clackup *app* :server *handler* :port 5000 :use-thread nil))
 
