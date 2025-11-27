@@ -419,7 +419,9 @@
 (defvar *app*
   (lambda (env)
     (let ((upgrade (gethash "upgrade" (getf env :headers)))
-          (accept (gethash "accept" (getf env :headers))))
+          (accept (gethash "accept" (getf env :headers)))
+          (path (getf env :path-info)))
+      (format t "Request path: ~A, Accept: ~A~%" path accept)
       (if (and upgrade (string-equal upgrade "websocket"))
           ;; WebSocket connection
           (let ((ws (make-server env)))
@@ -439,22 +441,47 @@
             (lambda (responder)
               (declare (ignore responder))
               (start-connection ws)))
-          ;; Normal HTTP request - NIP-11 relay information
-          (if (and accept (search "application/nostr+json" accept))
-              '(200 (:content-type "application/nostr+json")
-                ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}"))
-              '(404 () ("Not Found")))))))
+          ;; Normal HTTP request
+          (cond
+            ;; NIP-11 relay information
+            ((and accept (search "application/nostr+json" accept))
+             '(200 (:content-type "application/nostr+json")
+               ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}")))
+            ;; Redirect / to /index.html
+            ((string= path "/")
+             (format t "Redirecting / to /index.html~%")
+             '(301 (:location "/index.html") ()))
+            ;; Not found
+            (t
+             (format t "Not found: ~A~%" path)
+             '(404 () ("Not Found"))))))))
+
+(defun plist-set (plist key value)
+  "Set a key-value pair in a plist"
+  (let ((result (copy-list plist)))
+    (setf (getf result key) value)
+    result))
 
 (defun main ()
   ;; Database initialization and server startup
   (initialize)
   (connect-db)
-  (clack:clackup 
-   (lack:builder
-    (:static :path "/" 
-             :root (merge-pathnames "public/" 
-                                    (or *load-pathname* 
-                                        *compile-file-pathname* 
-                                        #p"/app/")))
-    *app*)
-   :server *handler* :port 5000 :use-thread nil))
+  (let ((public-path (merge-pathnames "public/" 
+                                      (or *load-pathname* 
+                                          *compile-file-pathname*
+                                          (truename ".")
+                                          #p"/app/"))))
+    (format t "Static files path: ~A~%" public-path)
+    (clack:clackup 
+     (lack:builder
+      ;; Rewrite / to /index.html
+      (lambda (app)
+        (lambda (env)
+          (let ((path (getf env :path-info)))
+            (if (string= path "/")
+                (funcall app (plist-set env :path-info "/index.html"))
+                (funcall app env)))))
+      (:static :path "/" :root public-path)
+      *app*)
+     :server *handler* :port 5000 :use-thread nil)))
+
