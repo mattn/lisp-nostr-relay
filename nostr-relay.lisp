@@ -470,5 +470,5 @@
                                            (truename ".")
                                            #p"/app/")))
   (format t "Static files path: ~A~%" *public-path*)
-  (clack:clackup *app* :server *handler* :port 5000 :use-thread nil))
+  (clack:clackup *app* :server *handler* :address "0.0.0.0" :port 5000 :use-thread nil))
 
