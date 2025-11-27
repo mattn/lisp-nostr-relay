@@ -12,7 +12,7 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :jonathan :postmodern :ironclad :babel :alexandria) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :jonathan :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
 
 (in-package :cl-user)
 (defpackage nostr-relay
@@ -152,19 +152,40 @@
                    (parse-integer hex-string :start (* i 2) :end (* (1+ i) 2) :radix 16)))
     bytes))
 
-;; Schnorr signature verification (simplified version - full implementation requires external library)
+;; Schnorr signature verification (BIP340) using libsecp256k1
 (defun verify-schnorr-signature (pubkey message sig)
-  "Verify Schnorr signature (Warning: simplified implementation)"
-  ;; Proper secp256k1 Schnorr signature verification is needed
-  ;; Currently only performs basic format checking
+  "Verify Schnorr signature using secp256k1_schnorrsig_verify"
   (handler-case
-      (and (= (length pubkey) 64)  ; 32 bytes = 64 hex characters
-           (= (length sig) 128)     ; 64 bytes = 128 hex characters
-           (= (length message) 64)  ; 32 bytes = 64 hex characters
-           ;; TODO: Implement actual secp256k1 verification
-           t)
+      (let ((ctx (secp256k1::ensure-context))
+            (pubkey-bytes (hex-to-bytes pubkey))
+            (message-bytes (hex-to-bytes message))
+            (sig-bytes (hex-to-bytes sig)))
+        ;; Check lengths
+        (unless (and (= (length pubkey-bytes) 32)
+                     (= (length message-bytes) 32)
+                     (= (length sig-bytes) 64))
+          (return-from verify-schnorr-signature nil))
+        ;; Create foreign arrays
+        (cffi:with-foreign-objects ((xonly-pubkey '(:struct secp256k1::secp256k1-xonly-pubkey))
+                                     (sig-ptr :uchar 64)
+                                     (msg-ptr :uchar 32)
+                                     (pubkey-ptr :uchar 32))
+          ;; Copy bytes to foreign memory
+          (loop for i from 0 below 32
+                do (setf (cffi:mem-aref pubkey-ptr :uchar i) (aref pubkey-bytes i))
+                   (setf (cffi:mem-aref msg-ptr :uchar i) (aref message-bytes i)))
+          (loop for i from 0 below 64
+                do (setf (cffi:mem-aref sig-ptr :uchar i) (aref sig-bytes i)))
+          ;; Parse x-only pubkey
+          (let ((parse-result (secp256k1::secp256k1-xonly-pubkey-parse ctx xonly-pubkey pubkey-ptr)))
+            (unless (= parse-result 1)
+              (format t "Failed to parse x-only pubkey~%")
+              (return-from verify-schnorr-signature nil))
+            ;; Verify schnorr signature
+            (let ((verify-result (secp256k1::secp256k1-schnorrsig-verify ctx sig-ptr msg-ptr 32 xonly-pubkey)))
+              (= verify-result 1)))))
     (error (e)
-      (format t "Signature verification error: ~A~%" e)
+      (format t "Schnorr verification error: ~A~%" e)
       nil)))
 
 ;; Event verification

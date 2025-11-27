@@ -55,16 +55,22 @@ cd lisp-nostr-relay
 - SBCL (Steel Bank Common Lisp)
 - Quicklisp
 - PostgreSQL
+- libsecp256k1
 
 Required Lisp libraries (automatically loaded via Quicklisp):
 - websocket-driver
 - clack
 - clack-handler-hunchentoot
-- lack
 - jonathan
 - postmodern
 - ironclad
 - babel
+- alexandria
+- cl-secp256k1 (install manually: `~/quicklisp/local-projects/`)
+
+## Notes
+
+**Signature Verification**: Currently, Schnorr signature verification is not fully implemented. The relay accepts events based on format validation only. To enable full signature verification, install `libsecp256k1` and `cl-secp256k1`.
 
 ## Configuration
 
