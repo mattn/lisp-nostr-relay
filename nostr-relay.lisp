@@ -379,10 +379,26 @@
       (format t "Error handling REQ: ~A~%" e)
       (send ws (jonathan:to-json (list "EOSE" subscription-id))))))
 
+(defun has-protected-tag (event)
+  "Check if event has a '-' tag (NIP-70 Protected Events)"
+  (let ((tags (cdr (assoc "tags" event :test #'equal))))
+    (when (listp tags)
+      (some (lambda (tag)
+              (and (listp tag)
+                   (> (length tag) 0)
+                   (equal (first tag) "-")))
+            tags))))
+
 (defun handle-event (ws event-data)
   "Handle EVENT message"
   (let ((event event-data))
     (format t "Storing event: ~A~%" event)
+    ;; Check for protected event (NIP-70)
+    (when (has-protected-tag event)
+      (let ((event-id (cdr (assoc "id" event :test #'equal))))
+        (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
+        (send ws (jonathan:to-json (list "OK" event-id nil "blocked: event contains '-' tag (NIP-70)")))
+        (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
         (progn
@@ -479,7 +495,7 @@
                         :access-control-allow-origin "*"
                         :access-control-allow-headers "Content-Type"
                         :access-control-allow-methods "GET")
-                   ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}")))
+                   ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40,70]}")))
                 ;; Static files
                 (t
                  (handler-case
