@@ -10,7 +10,7 @@
                    (t nil))))
     (if target
         (load target)
-        (error nil "Quicklisp setup.lisp が見つかりません。 ~/.quicklisp/, ~/.roswell/, ~/.ros/ を確認してください。"))))
+        (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
 (ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :jonathan :postmodern :ironclad :babel :alexandria) :silent t)
 
