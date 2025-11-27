@@ -420,45 +420,58 @@
 
 (defvar *app*
   (lambda (env)
-    (let ((upgrade (gethash "upgrade" (getf env :headers)))
-          (accept (gethash "accept" (getf env :headers)))
-          (path (getf env :path-info)))
-      (format t "Request path: ~A, Accept: ~A~%" path accept)
-      (if (and upgrade (string-equal upgrade "websocket"))
-          ;; WebSocket connection
-          (let ((ws (make-server env)))
-            (push ws *clients*)
-            (on :message ws
-                (lambda (message)
-                  (handle-nostr-message ws message)))
-            (on :close ws
-                (lambda (&key code reason)
-                  (declare (ignore code reason))
-                  (setf *clients* (remove ws *clients*))
-                  ;; Remove subscriptions for this client
-                  (maphash (lambda (sub-id sub-info)
-                             (when (eq (getf sub-info :ws) ws)
-                               (remhash sub-id *subscriptions*)))
-                           *subscriptions*)))
-            (lambda (responder)
-              (declare (ignore responder))
-              (start-connection ws)))
-          ;; Normal HTTP request
-          (cond
-            ;; NIP-11 relay information
-            ((and accept (search "application/nostr+json" accept))
-             '(200 (:content-type "application/nostr+json")
-               ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}")))
-            ;; Static files
-            (t
-             (let* ((file-path (if (string= path "/")
-                                   (merge-pathnames "index.html" *public-path*)
-                                   (merge-pathnames (string-left-trim "/" path) *public-path*))))
-               (if (probe-file file-path)
-                   (let ((content (alexandria:read-file-into-byte-vector file-path))
-                         (content-type (hunchentoot:mime-type file-path)))
-                     (list 200 (list :content-type content-type) content))
-                   '(404 () ("Not Found")))))))))) 
+    (handler-case
+        (let ((upgrade (gethash "upgrade" (getf env :headers)))
+              (accept (gethash "accept" (getf env :headers)))
+              (path (getf env :path-info)))
+          (format t "~A Request path: ~A, Accept: ~A~%" 
+                  (get-universal-time) path accept)
+          (force-output)
+          (if (and upgrade (string-equal upgrade "websocket"))
+              ;; WebSocket connection
+              (let ((ws (make-server env)))
+                (push ws *clients*)
+                (on :message ws
+                    (lambda (message)
+                      (handler-case
+                          (handle-nostr-message ws message)
+                        (error (e)
+                          (format t "ERROR in WebSocket message handler: ~A~%" e)
+                          (force-output)))))
+                (on :close ws
+                    (lambda (&key code reason)
+                      (declare (ignore code reason))
+                      (setf *clients* (remove ws *clients*))
+                      ;; Remove subscriptions for this client
+                      (maphash (lambda (sub-id sub-info)
+                                 (when (eq (getf sub-info :ws) ws)
+                                   (remhash sub-id *subscriptions*)))
+                               *subscriptions*)))
+                (lambda (responder)
+                  (declare (ignore responder))
+                  (start-connection ws)))
+              ;; Normal HTTP request
+              (cond
+                ;; NIP-11 relay information
+                ((and accept (search "application/nostr+json" accept))
+                 '(200 (:content-type "application/nostr+json")
+                   ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}")))
+                ;; Static files
+                (t
+                 (let* ((file-path (if (string= path "/")
+                                       (merge-pathnames "index.html" *public-path*)
+                                       (merge-pathnames (string-left-trim "/" path) *public-path*))))
+                   (if (probe-file file-path)
+                       (let ((content (alexandria:read-file-into-byte-vector file-path))
+                             (content-type (hunchentoot:mime-type file-path)))
+                         (list 200 (list :content-type content-type) content))
+                       '(404 () ("Not Found"))))))))
+      (error (e)
+        (format t "ERROR in app handler: ~A~%~A~%" e 
+                (with-output-to-string (s)
+                  (sb-debug:print-backtrace :stream s :count 20)))
+        (force-output)
+        '(500 (:content-type "text/plain") ("Internal Server Error"))))))
 
 (defun main ()
   ;; Database initialization and server startup
