@@ -21,9 +21,14 @@ RUN sbcl --non-interactive \
     --quit
 
 FROM alpine:latest
-RUN apk add --no-cache zstd libsecp256k1
+RUN apk add --no-cache zstd libsecp256k1 && \
+    # Create symlink for libsecp256k1.so if needed
+    if [ ! -f /usr/lib/libsecp256k1.so ]; then \
+        ln -sf /usr/lib/libsecp256k1.so.* /usr/lib/libsecp256k1.so || true; \
+    fi
 WORKDIR /app
 ENV DATABASE_URL='postgres://postgres:password@db:5432/nostr-relay'
+ENV LD_LIBRARY_PATH=/usr/lib:/usr/local/lib
 COPY --from=builder /app/nostr-relay /app/nostr-relay
 COPY --from=builder /app/public /app/public
 EXPOSE 5000
