@@ -454,7 +454,10 @@
               (cond
                 ;; NIP-11 relay information
                 ((and accept (search "application/nostr+json" accept))
-                 '(200 (:content-type "application/nostr+json")
+                 '(200 (:content-type "application/nostr+json"
+                        :access-control-allow-origin "*"
+                        :access-control-allow-headers "Content-Type"
+                        :access-control-allow-methods "GET")
                    ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40]}")))
                 ;; Static files
                 (t
