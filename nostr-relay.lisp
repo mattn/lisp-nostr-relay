@@ -122,6 +122,13 @@
 
 (defvar *subscriptions* (make-hash-table :test 'equal))
 (defvar *clients* nil)
+(defvar *authenticated-clients* (make-hash-table :test 'eq))
+
+;; Generate challenge for NIP-42
+(defun generate-challenge ()
+  "Generate a random challenge string"
+  (ironclad:byte-array-to-hex-string
+   (ironclad:random-data 32)))
 
 ;; SHA-256 hash calculation
 (defun sha256-hex (string)
@@ -426,6 +433,53 @@
   "Handle CLOSE message"
   (remhash subscription-id *subscriptions*))
 
+(defun handle-auth (ws auth-event)
+  "Handle AUTH message (NIP-42)"
+  (handler-case
+      (let* ((event auth-event)
+             (kind (cdr (assoc "kind" event :test #'equal)))
+             (tags (cdr (assoc "tags" event :test #'equal)))
+             (created-at (cdr (assoc "created_at" event :test #'equal)))
+             (now (get-universal-time))
+             (challenge (gethash ws *authenticated-clients*)))
+        ;; Verify it's a kind 22242 event
+        (unless (= kind 22242)
+          (format t "AUTH: Invalid kind ~A, expected 22242~%" kind)
+          (send ws (jonathan:to-json (list "OK" (cdr (assoc "id" event :test #'equal)) nil "error: invalid auth event kind")))
+          (return-from handle-auth))
+        ;; Verify timestamp (within 10 minutes)
+        (when (> (abs (- now created-at)) 600)
+          (format t "AUTH: Timestamp too old or in future~%")
+          (send ws (jonathan:to-json (list "OK" (cdr (assoc "id" event :test #'equal)) nil "error: timestamp out of range")))
+          (return-from handle-auth))
+        ;; Find challenge and relay tags
+        (let ((challenge-tag nil)
+              (relay-tag nil))
+          (dolist (tag tags)
+            (when (and (listp tag) (>= (length tag) 2))
+              (cond
+                ((equal (first tag) "challenge")
+                 (setf challenge-tag (second tag)))
+                ((equal (first tag) "relay")
+                 (setf relay-tag (second tag))))))
+          ;; Verify challenge matches
+          (unless (and challenge-tag (equal challenge-tag challenge))
+            (format t "AUTH: Invalid or missing challenge~%")
+            (send ws (jonathan:to-json (list "OK" (cdr (assoc "id" event :test #'equal)) nil "error: invalid challenge")))
+            (return-from handle-auth))
+          ;; Verify signature
+          (unless (verify-event event)
+            (format t "AUTH: Signature verification failed~%")
+            (send ws (jonathan:to-json (list "OK" (cdr (assoc "id" event :test #'equal)) nil "error: invalid signature")))
+            (return-from handle-auth))
+          ;; Authentication successful
+          (let ((pubkey (cdr (assoc "pubkey" event :test #'equal))))
+            (setf (gethash ws *authenticated-clients*) pubkey)
+            (format t "AUTH: Client authenticated as ~A~%" pubkey)
+            (send ws (jonathan:to-json (list "OK" (cdr (assoc "id" event :test #'equal)) t ""))))))
+    (error (e)
+      (format t "Error handling AUTH: ~A~%" e))))
+
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
   (handler-case
@@ -449,7 +503,11 @@
               ((equal type "CLOSE")
                (when (>= (length msg) 2)
                  (format t "Handling CLOSE~%")
-                 (handle-close (second msg))))))))
+                 (handle-close (second msg))))
+              ((equal type "AUTH")
+               (when (>= (length msg) 2)
+                 (format t "Handling AUTH~%")
+                 (handle-auth ws (second msg))))))))
     (error (e)
       (format t "Error processing message: ~A~%" e))))
 
@@ -466,8 +524,16 @@
           (force-output)
           (if (and upgrade (string-equal upgrade "websocket"))
               ;; WebSocket connection
-              (let ((ws (make-server env)))
+              (let ((ws (make-server env))
+                    (challenge (generate-challenge)))
                 (push ws *clients*)
+                ;; Store challenge for this client
+                (setf (gethash ws *authenticated-clients*) challenge)
+                ;; Send AUTH challenge
+                (on :open ws
+                    (lambda ()
+                      (send ws (jonathan:to-json (list "AUTH" challenge)))
+                      (format t "Sent AUTH challenge to client: ~A~%" challenge)))
                 (on :message ws
                     (lambda (message)
                       (handler-case
@@ -479,6 +545,8 @@
                     (lambda (&key code reason)
                       (declare (ignore code reason))
                       (setf *clients* (remove ws *clients*))
+                      ;; Remove authentication state
+                      (remhash ws *authenticated-clients*)
                       ;; Remove subscriptions for this client
                       (maphash (lambda (sub-id sub-info)
                                  (when (eq (getf sub-info :ws) ws)
@@ -495,7 +563,7 @@
                         :access-control-allow-origin "*"
                         :access-control-allow-headers "Content-Type"
                         :access-control-allow-methods "GET")
-                   ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40,70]}")))
+                   ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40,42,70]}")))
                 ;; Static files
                 (t
                  (handler-case

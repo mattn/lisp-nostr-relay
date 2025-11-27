@@ -19,6 +19,7 @@ This relay supports the following Nostr Implementation Possibilities (NIPs):
 - **NIP-28**: Public Chat
 - **NIP-33**: Parameterized Replaceable Events (kind 30000-39999)
 - **NIP-40**: Expiration Timestamp
+- **NIP-42**: Authentication of clients to relays
 - **NIP-70**: Protected Events (rejects events with "-" tag)
 
 ## Usage
