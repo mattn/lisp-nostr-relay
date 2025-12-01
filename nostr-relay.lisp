@@ -345,7 +345,7 @@
           (let* ((where-clause (if conditions
                                    (format nil "WHERE ~{~A~^ OR ~}" conditions)
                                    ""))
-                 (sql (format nil "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event ~A ORDER BY created_at DESC LIMIT ~A" where-clause max-limit)))
+                 (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT ~A" where-clause max-limit)))
             (format t "SQL: ~A~%" sql)
             (let ((results (postmodern:query sql)))
               (format t "Results count: ~A~%" (length results))
@@ -354,11 +354,15 @@
                 (destructuring-bind (id pubkey created-at kind tags content sig) row
                   (let* ((parsed-tags (cond
                                         ((null tags) '())
-                                        ((listp tags) tags)
                                         ((stringp tags)
                                          (handler-case
-                                             (jonathan:parse tags)
-                                           (error () '())))
+                                             (let* ((tag-bytes (babel:string-to-octets tags :encoding :utf-8))
+                                                    (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8)))
+                                               (jonathan:parse tag-str))
+                                           (error (e) 
+                                             (format t "Error parsing tags: ~A~%" e)
+                                             '())))
+                                        ((listp tags) tags)
                                         (t '())))
                          (event (list (cons "id" id)
                                       (cons "pubkey" pubkey)
