@@ -12,7 +12,7 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :jonathan :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :cl-json :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
 
 (in-package :cl-user)
 (defpackage nostr-relay
@@ -138,7 +138,7 @@
          (kind (cdr (assoc "kind" event :test #'equal)))
          (tags (cdr (assoc "tags" event :test #'equal)))
          (content (cdr (assoc "content" event :test #'equal)))
-         (serialized (jonathan:to-json 
+         (serialized (json:encode-json-to-string 
                       (list 0 pubkey created-at kind tags content))))
     (sha256-hex serialized)))
 
@@ -257,7 +257,7 @@
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
-                      (jonathan:to-json tags)
+                      (json:encode-json-to-string tags)
                       content sig)
              ;; Delete older events with same pubkey and kind
              (execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
@@ -270,7 +270,7 @@
                          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind 
-                        (jonathan:to-json tags)
+                        (json:encode-json-to-string tags)
                         content sig)
                ;; Delete older events with same pubkey, kind, and d tag
                (execute "DELETE FROM event 
@@ -284,7 +284,7 @@
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
-                      (jonathan:to-json tags)
+                      (json:encode-json-to-string tags)
                       content sig)))
         (error (e)
           (format t "Error storing event: ~A~%" e))))))
@@ -358,7 +358,7 @@
                                          (handler-case
                                              (let* ((tag-bytes (babel:string-to-octets tags :encoding :utf-8))
                                                     (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8)))
-                                               (jonathan:parse tag-str))
+                                               (json:decode-json-from-string tag-str))
                                            (error (e) 
                                              (format t "Error parsing tags: ~A~%" e)
                                              '())))
@@ -372,16 +372,16 @@
                                       (cons "content" content)
                                       (cons "sig" sig))))
                     (format t "Sending event: ~A~%" id)
-                    (send ws (jonathan:to-json (vector "EVENT" subscription-id event) :from :alist))))))))
+                    (send ws (json:encode-json-to-string (vector "EVENT" subscription-id event)))))))))
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
-        (send ws (jonathan:to-json (list "EOSE" subscription-id)))
+        (send ws (json:encode-json-to-string (list "EOSE" subscription-id)))
         ;; Save subscription
         (setf (gethash subscription-id *subscriptions*)
               (list :ws ws :filters filters)))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
-      (send ws (jonathan:to-json (list "EOSE" subscription-id))))))
+      (send ws (json:encode-json-to-string (list "EOSE" subscription-id))))))
 
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
@@ -401,7 +401,7 @@
     (when (has-protected-tag event)
       (let ((event-id (cdr (assoc "id" event :test #'equal))))
         (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
-        (send ws (jonathan:to-json (list "OK" event-id nil "blocked: event contains '-' tag (NIP-70)")))
+        (send ws (json:encode-json-to-string (list "OK" event-id nil "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
@@ -411,7 +411,7 @@
           ;; Send OK response
           (let ((event-id (cdr (assoc "id" event :test #'equal))))
             (format t "Sending OK for event: ~A~%" event-id)
-            (send ws (jonathan:to-json (list "OK" event-id t ""))))
+            (send ws (json:encode-json-to-string (list "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
           (maphash (lambda (sub-id sub-info)
                      (let ((sub-ws (getf sub-info :ws))
@@ -419,12 +419,12 @@
                        ;; Check if event matches any filter
                        (when (some (lambda (filter) (match-filter event filter)) filters)
                          (format t "Broadcasting event to subscription: ~A~%" sub-id)
-                         (send sub-ws (jonathan:to-json (vector "EVENT" sub-id event) :from :alist)))))
+                         (send sub-ws (json:encode-json-to-string (vector "EVENT" sub-id event))))))
                    *subscriptions*))
         ;; Verification failed
         (let ((event-id (cdr (assoc "id" event :test #'equal))))
           (format t "Event verification failed: ~A~%" event-id)
-          (send ws (jonathan:to-json (list "OK" event-id nil "invalid: signature verification failed")))))))
+          (send ws (json:encode-json-to-string (list "OK" event-id nil "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id)
   "Handle CLOSE message"
@@ -433,7 +433,7 @@
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
   (handler-case
-      (let ((msg (jonathan:parse message :as :alist)))
+      (let ((msg (json:decode-json-from-string message)))
         (format t "Received message: ~A~%" message)
         (format t "Parsed as: ~A~%" msg)
         (when (and (listp msg) (> (length msg) 0))
