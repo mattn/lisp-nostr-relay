@@ -123,6 +123,19 @@
 (defvar *subscriptions* (make-hash-table :test 'equal))
 (defvar *clients* nil)
 
+;; Helper function to get event field (handles both string and keyword keys)
+(defun event-field (field event)
+  "Get field value from event alist (field can be string or keyword)"
+  (let* ((field-str (if (stringp field) field (string field)))
+         ;; JSON parser converts each underscore to two hyphens
+         (field-key (with-output-to-string (s)
+                      (loop for ch across field-str
+                            do (if (char= ch #\_)
+                                   (princ "--" s)
+                                   (princ (char-upcase ch) s))))))
+    (or (cdr (assoc (intern field-key :keyword) event))
+        (cdr (assoc field event :test #'equal)))))
+
 ;; SHA-256 hash calculation
 (defun sha256-hex (string)
   "Return SHA-256 hash of string as hexadecimal string"
@@ -133,11 +146,12 @@
 ;; Compute event ID
 (defun compute-event-id (event)
   "Compute Nostr event ID"
-  (let* ((pubkey (cdr (assoc "pubkey" event :test #'equal)))
-         (created-at (cdr (assoc "created_at" event :test #'equal)))
-         (kind (cdr (assoc "kind" event :test #'equal)))
-         (tags (cdr (assoc "tags" event :test #'equal)))
-         (content (cdr (assoc "content" event :test #'equal)))
+  (let* ((pubkey (event-field "pubkey" event))
+         (created-at (event-field "created_at" event))
+         (kind (event-field "kind" event))
+         (tags-raw (event-field "tags" event))
+         (tags (if (null tags-raw) (vector) tags-raw))
+         (content (event-field "content" event))
          (serialized (json:encode-json-to-string 
                       (list 0 pubkey created-at kind tags content))))
     (sha256-hex serialized)))
@@ -192,9 +206,9 @@
 (defun verify-event (event)
   "Verify Nostr event signature and ID"
   (handler-case
-      (let ((id (cdr (assoc "id" event :test #'equal)))
-            (pubkey (cdr (assoc "pubkey" event :test #'equal)))
-            (sig (cdr (assoc "sig" event :test #'equal)))
+      (let ((id (event-field "id" event))
+            (pubkey (event-field "pubkey" event))
+            (sig (event-field "sig" event))
             (computed-id (compute-event-id event)))
         (format t "Event ID: ~A~%" id)
         (format t "Computed ID: ~A~%" computed-id)
@@ -237,13 +251,13 @@
 
 (defun store-event (event)
   "Store event in PostgreSQL"
-  (let ((id (cdr (assoc "id" event :test #'equal)))
-        (pubkey (cdr (assoc "pubkey" event :test #'equal)))
-        (created-at (cdr (assoc "created_at" event :test #'equal)))
-        (kind (cdr (assoc "kind" event :test #'equal)))
-        (tags (cdr (assoc "tags" event :test #'equal)))
-        (content (cdr (assoc "content" event :test #'equal)))
-        (sig (cdr (assoc "sig" event :test #'equal))))
+  (let ((id (event-field "id" event))
+        (pubkey (event-field "pubkey" event))
+        (created-at (event-field "created_at" event))
+        (kind (event-field "kind" event))
+        (tags (event-field "tags" event))
+        (content (event-field "content" event))
+        (sig (event-field "sig" event)))
     (when id
       (handler-case
           (cond
@@ -291,10 +305,10 @@
 
 (defun match-filter (event filter)
   "Check if event matches filter"
-  (let ((event-kind (cdr (assoc "kind" event :test #'equal)))
-        (event-pubkey (cdr (assoc "pubkey" event :test #'equal)))
-        (filter-kinds (cdr (assoc "kinds" filter :test #'equal)))
-        (filter-authors (cdr (assoc "authors" filter :test #'equal))))
+  (let ((event-kind (event-field "kind" event))
+        (event-pubkey (event-field "pubkey" event))
+        (filter-kinds (event-field "kinds" filter))
+        (filter-authors (event-field "authors" filter)))
     ;; Check kinds filter
     (when (and filter-kinds (not (member event-kind filter-kinds :test #'equal)))
       (return-from match-filter nil))
@@ -309,11 +323,11 @@
   (let ((filter-conditions nil)
         (max-limit 100))
     (dolist (filter filters)
-      (let ((kinds (cdr (assoc "kinds" filter :test #'equal)))
-            (authors (cdr (assoc "authors" filter :test #'equal)))
-            (since (cdr (assoc "since" filter :test #'equal)))
-            (until (cdr (assoc "until" filter :test #'equal)))
-            (limit (cdr (assoc "limit" filter :test #'equal)))
+      (let ((kinds (event-field "kinds" filter))
+            (authors (event-field "authors" filter))
+            (since (event-field "since" filter))
+            (until (event-field "until" filter))
+            (limit (event-field "limit" filter))
             (conditions nil))
         (when limit
           (setf max-limit (min max-limit limit)))
@@ -399,7 +413,7 @@
     (format t "Storing event: ~A~%" event)
     ;; Check for protected event (NIP-70)
     (when (has-protected-tag event)
-      (let ((event-id (cdr (assoc "id" event :test #'equal))))
+      (let ((event-id (event-field "id" event)))
         (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
         (send ws (json:encode-json-to-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
@@ -409,7 +423,7 @@
           ;; Store event
           (store-event event)
           ;; Send OK response
-          (let ((event-id (cdr (assoc "id" event :test #'equal))))
+          (let ((event-id (event-field "id" event)))
             (format t "Sending OK for event: ~A~%" event-id)
             (send ws (json:encode-json-to-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
@@ -422,7 +436,7 @@
                          (send sub-ws (json:encode-json-to-string (vector "EVENT" sub-id event))))))
                    *subscriptions*))
         ;; Verification failed
-        (let ((event-id (cdr (assoc "id" event :test #'equal))))
+        (let ((event-id (event-field "id" event)))
           (format t "Event verification failed: ~A~%" event-id)
           (send ws (json:encode-json-to-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
 
@@ -535,9 +549,10 @@
                                            *compile-file-pathname*
                                            (truename ".")
                                            #p"/app/")))
-  (format t "Static files path: ~A~%" *public-path*)
-  (format t "Starting server on 0.0.0.0:5000~%")
-  (force-output)
-  (clack:clackup *app* :server *handler* :address "0.0.0.0" :port 5000 :use-thread t)
-  (loop (sleep 1)))
+  (let ((port (parse-integer (or (asdf::getenv "PORT") "5000"))))
+    (format t "Static files path: ~A~%" *public-path*)
+    (format t "Starting server on 0.0.0.0:~A~%" port)
+    (force-output)
+    (clack:clackup *app* :server *handler* :address "0.0.0.0" :port port :use-thread t)
+    (loop (sleep 1))))
 
