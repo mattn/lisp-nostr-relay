@@ -577,8 +577,8 @@
                      (setf (gethash "max_event_tags" limitation) 2000)
                      (setf (gethash "max_content_length" limitation) 65536)
                      (setf (gethash "min_pow_difficulty" limitation) 0)
-                     (setf (gethash "auth_required" limitation) nil)
-                     (setf (gethash "payment_required" limitation) nil)
+                     (setf (gethash "auth_required" limitation) yason:false)
+                     (setf (gethash "payment_required" limitation) yason:false)
                      (setf (gethash "limitation" info) limitation))
                    (list 200 
                          (list :content-type "application/nostr+json"
