@@ -548,11 +548,44 @@
               (cond
                 ;; NIP-11 relay information
                 ((and accept (search "application/nostr+json" accept))
-                 '(200 (:content-type "application/nostr+json"
-                        :access-control-allow-origin "*"
-                        :access-control-allow-headers "Content-Type"
-                        :access-control-allow-methods "GET")
-                   ("{\"name\":\"Common Lisp Nostr Relay\",\"description\":\"A simple Nostr relay\",\"supported_nips\":[1,2,9,11,12,15,16,20,22,26,28,33,40,70]}")))
+                 (let* ((relay-name (or (asdf::getenv "RELAY_NAME") "Lisp Nostr Relay"))
+                        (relay-description (or (asdf::getenv "RELAY_DESCRIPTION") 
+                                               "A lightweight Nostr relay implementation in Common Lisp"))
+                        (relay-pubkey (or (asdf::getenv "RELAY_PUBKEY") ""))
+                        (relay-contact (or (asdf::getenv "RELAY_CONTACT") ""))
+                        (relay-icon (or (asdf::getenv "RELAY_ICON") ""))
+                        (info (make-hash-table :test 'equal)))
+                   (setf (gethash "name" info) relay-name)
+                   (setf (gethash "description" info) relay-description)
+                   (when (not (string= relay-pubkey ""))
+                     (setf (gethash "pubkey" info) relay-pubkey))
+                   (when (not (string= relay-contact ""))
+                     (setf (gethash "contact" info) relay-contact))
+                   (when (not (string= relay-icon ""))
+                     (setf (gethash "icon" info) relay-icon))
+                   (setf (gethash "supported_nips" info) 
+                         (vector 1 2 4 9 11 12 15 16 20 22 28 33 40 50 62 70))
+                   (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
+                   (setf (gethash "version" info) "1.0.0")
+                   (let ((limitation (make-hash-table :test 'equal)))
+                     (setf (gethash "max_message_length" limitation) 65536)
+                     (setf (gethash "max_subscriptions" limitation) 20)
+                     (setf (gethash "max_filters" limitation) 10)
+                     (setf (gethash "max_limit" limitation) 500)
+                     (setf (gethash "max_subid_length" limitation) 100)
+                     (setf (gethash "min_prefix" limitation) 4)
+                     (setf (gethash "max_event_tags" limitation) 2000)
+                     (setf (gethash "max_content_length" limitation) 65536)
+                     (setf (gethash "min_pow_difficulty" limitation) 0)
+                     (setf (gethash "auth_required" limitation) nil)
+                     (setf (gethash "payment_required" limitation) nil)
+                     (setf (gethash "limitation" info) limitation))
+                   (list 200 
+                         (list :content-type "application/nostr+json"
+                               :access-control-allow-origin "*"
+                               :access-control-allow-headers "Content-Type"
+                               :access-control-allow-methods "GET")
+                         (list (encode-json-to-string info)))))
                 ;; Static files
                 (t
                  (handler-case
