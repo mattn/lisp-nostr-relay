@@ -261,7 +261,9 @@
         (pubkey (event-field "pubkey" event))
         (created-at (event-field "created_at" event))
         (kind (event-field "kind" event))
-        (tags (event-field "tags" event))
+        (tags-raw (event-field "tags" event))
+        (tags (let ((t-raw (event-field "tags" event)))
+                (if (null t-raw) (vector) t-raw)))
         (content (event-field "content" event))
         (sig (event-field "sig" event)))
     (when id
@@ -472,7 +474,11 @@
                        ;; Check if event matches any filter
                        (when (some (lambda (filter) (match-filter event filter)) filters)
                          (format t "Broadcasting event to subscription: ~A~%" sub-id)
-                         (send sub-ws (encode-json-to-string (vector "EVENT" sub-id event))))))
+                         ;; Convert alist to hash table for encoding
+                         (let ((event-hash (make-hash-table :test 'equal)))
+                           (dolist (pair event)
+                             (setf (gethash (car pair) event-hash) (cdr pair)))
+                           (send sub-ws (encode-json-to-string (vector "EVENT" sub-id event-hash)))))))
                    *subscriptions*))
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
