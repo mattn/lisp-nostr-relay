@@ -12,7 +12,7 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :cl-json :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
 
 (in-package :cl-user)
 (defpackage nostr-relay
@@ -136,6 +136,12 @@
     (or (cdr (assoc (intern field-key :keyword) event))
         (cdr (assoc field event :test #'equal)))))
 
+;; Helper function to encode JSON with yason (supports raw UTF-8)
+(defun encode-json-to-string (obj)
+  "Encode object to JSON string using yason (supports raw UTF-8)"
+  (with-output-to-string (s)
+    (yason:encode obj s)))
+
 ;; SHA-256 hash calculation
 (defun sha256-hex (string)
   "Return SHA-256 hash of string as hexadecimal string"
@@ -152,7 +158,7 @@
          (tags-raw (event-field "tags" event))
          (tags (if (null tags-raw) (vector) tags-raw))
          (content (event-field "content" event))
-         (serialized (json:encode-json-to-string 
+         (serialized (encode-json-to-string 
                       (list 0 pubkey created-at kind tags content))))
     (sha256-hex serialized)))
 
@@ -271,7 +277,7 @@
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
-                      (json:encode-json-to-string tags)
+                      (encode-json-to-string tags)
                       content sig)
              ;; Delete older events with same pubkey and kind
              (execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
@@ -284,7 +290,7 @@
                          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind 
-                        (json:encode-json-to-string tags)
+                        (encode-json-to-string tags)
                         content sig)
                ;; Delete older events with same pubkey, kind, and d tag
                (execute "DELETE FROM event 
@@ -298,7 +304,7 @@
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
-                      (json:encode-json-to-string tags)
+                      (encode-json-to-string tags)
                       content sig)))
         (error (e)
           (format t "Error storing event: ~A~%" e))))))
@@ -345,6 +351,16 @@
           (push (format nil "created_at >= ~A" since) conditions))
         (when until
           (push (format nil "created_at <= ~A" until) conditions))
+        ;; Handle tag filters (#e, #p, etc.)
+        (dolist (pair filter)
+          (when (consp pair)
+            (let ((key (car pair))
+                  (value (cdr pair)))
+              (when (stringp key)
+                (when (and (> (length key) 1) (char= (char key 0) #\#))
+                  (when (and value (listp value))
+                    (dolist (tag-value value)
+                      (push (format nil "'~A' = ANY(tagvalues)" tag-value) conditions))))))))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
     (values filter-conditions max-limit)))
@@ -367,35 +383,58 @@
               (dolist (row results)
                 (destructuring-bind (id pubkey created-at kind tags content sig) row
                   (let* ((parsed-tags (cond
-                                        ((null tags) '())
+                                        ((null tags) (vector))
                                         ((stringp tags)
                                          (handler-case
                                              (let* ((tag-bytes (babel:string-to-octets tags :encoding :utf-8))
-                                                    (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8)))
-                                               (json:decode-json-from-string tag-str))
+                                                    (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8))
+                                                    (alist-tags (yason:parse tag-str :object-as :alist)))
+                                               ;; Convert alist to vector of vectors with all strings
+                                               (map 'vector 
+                                                    (lambda (tag) 
+                                                      (map 'vector 
+                                                           (lambda (item)
+                                                             (if (stringp item)
+                                                                 item
+                                                                 (format nil "~(~A~)" item)))
+                                                           tag))
+                                                    alist-tags))
                                            (error (e) 
                                              (format t "Error parsing tags: ~A~%" e)
-                                             '())))
-                                        ((listp tags) tags)
-                                        (t '())))
-                         (event (list (cons "id" id)
-                                      (cons "pubkey" pubkey)
-                                      (cons "created_at" created-at)
-                                      (cons "kind" kind)
-                                      (cons "tags" parsed-tags)
-                                      (cons "content" content)
-                                      (cons "sig" sig))))
+                                             (vector))))
+                                        ((listp tags) 
+                                         (map 'vector 
+                                              (lambda (tag) 
+                                                (map 'vector 
+                                                     (lambda (item)
+                                                       (if (stringp item)
+                                                           item
+                                                           (format nil "~(~A~)" item)))
+                                                     tag))
+                                              tags))
+                                        (t (vector))))
+                         (event-alist (list (cons "id" id)
+                                            (cons "pubkey" pubkey)
+                                            (cons "created_at" created-at)
+                                            (cons "kind" kind)
+                                            (cons "tags" parsed-tags)
+                                            (cons "content" content)
+                                            (cons "sig" sig)))
+                         (event-hash (let ((ht (make-hash-table :test 'equal)))
+                                       (dolist (pair event-alist)
+                                         (setf (gethash (car pair) ht) (cdr pair)))
+                                       ht)))
                     (format t "Sending event: ~A~%" id)
-                    (send ws (json:encode-json-to-string (vector "EVENT" subscription-id event)))))))))
+                    (send ws (encode-json-to-string (vector "EVENT" subscription-id event-hash)))))))))
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
-        (send ws (json:encode-json-to-string (vector "EOSE" subscription-id)))
+        (send ws (encode-json-to-string (vector "EOSE" subscription-id)))
         ;; Save subscription
         (setf (gethash subscription-id *subscriptions*)
               (list :ws ws :filters filters)))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
-      (send ws (json:encode-json-to-string (vector "EOSE" subscription-id))))))
+      (send ws (encode-json-to-string (vector "EOSE" subscription-id))))))
 
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
@@ -415,7 +454,7 @@
     (when (has-protected-tag event)
       (let ((event-id (event-field "id" event)))
         (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
-        (send ws (json:encode-json-to-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
+        (send ws (encode-json-to-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
@@ -425,7 +464,7 @@
           ;; Send OK response
           (let ((event-id (event-field "id" event)))
             (format t "Sending OK for event: ~A~%" event-id)
-            (send ws (json:encode-json-to-string (vector "OK" event-id t ""))))
+            (send ws (encode-json-to-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
           (maphash (lambda (sub-id sub-info)
                      (let ((sub-ws (getf sub-info :ws))
@@ -433,12 +472,12 @@
                        ;; Check if event matches any filter
                        (when (some (lambda (filter) (match-filter event filter)) filters)
                          (format t "Broadcasting event to subscription: ~A~%" sub-id)
-                         (send sub-ws (json:encode-json-to-string (vector "EVENT" sub-id event))))))
+                         (send sub-ws (encode-json-to-string (vector "EVENT" sub-id event))))))
                    *subscriptions*))
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (format t "Event verification failed: ~A~%" event-id)
-          (send ws (json:encode-json-to-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
+          (send ws (encode-json-to-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id)
   "Handle CLOSE message"
@@ -447,7 +486,7 @@
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
   (handler-case
-      (let ((msg (json:decode-json-from-string message)))
+      (let ((msg (yason:parse message :object-as :alist)))
         (format t "Received message: ~A~%" message)
         (format t "Parsed as: ~A~%" msg)
         (when (and (listp msg) (> (length msg) 0))
