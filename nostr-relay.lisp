@@ -375,13 +375,13 @@
                     (send ws (json:encode-json-to-string (vector "EVENT" subscription-id event)))))))))
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
-        (send ws (json:encode-json-to-string (list "EOSE" subscription-id)))
+        (send ws (json:encode-json-to-string (vector "EOSE" subscription-id)))
         ;; Save subscription
         (setf (gethash subscription-id *subscriptions*)
               (list :ws ws :filters filters)))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
-      (send ws (json:encode-json-to-string (list "EOSE" subscription-id))))))
+      (send ws (json:encode-json-to-string (vector "EOSE" subscription-id))))))
 
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
@@ -401,7 +401,7 @@
     (when (has-protected-tag event)
       (let ((event-id (cdr (assoc "id" event :test #'equal))))
         (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
-        (send ws (json:encode-json-to-string (list "OK" event-id nil "blocked: event contains '-' tag (NIP-70)")))
+        (send ws (json:encode-json-to-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
@@ -411,7 +411,7 @@
           ;; Send OK response
           (let ((event-id (cdr (assoc "id" event :test #'equal))))
             (format t "Sending OK for event: ~A~%" event-id)
-            (send ws (json:encode-json-to-string (list "OK" event-id t ""))))
+            (send ws (json:encode-json-to-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
           (maphash (lambda (sub-id sub-info)
                      (let ((sub-ws (getf sub-info :ws))
@@ -424,7 +424,7 @@
         ;; Verification failed
         (let ((event-id (cdr (assoc "id" event :test #'equal))))
           (format t "Event verification failed: ~A~%" event-id)
-          (send ws (json:encode-json-to-string (list "OK" event-id nil "invalid: signature verification failed")))))))
+          (send ws (json:encode-json-to-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id)
   "Handle CLOSE message"
