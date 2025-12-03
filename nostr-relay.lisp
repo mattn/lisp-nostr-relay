@@ -482,7 +482,7 @@
             (format t "SQL: ~A~%" sql)
             (format t "Params: ~A~%" params)
             (let ((results (with-db-retry
-                             (query sql params))))
+                             (cl-postgres:exec-query *database* sql 'list-row-reader params))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
