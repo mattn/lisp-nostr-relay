@@ -126,36 +126,35 @@
     nil))
 
 ;; Execute query with automatic reconnection
-(defun db-execute (query &rest params)
-  (dotimes (retry 2)
-    (handler-case
-        (return-from db-execute
-          (if params
-              (apply #'execute query params)
-              (execute query)))
-      (error (e)
-        (format t "Database error: ~A~%" e)
-        (when (= retry 0)
-          (if (ensure-db-connection)
-              (format t "Reconnected, retrying query...~%")
-              (error "Database reconnection failed"))))))
-  (error "Query failed after reconnection attempt"))
+(defmacro with-db-retry (&body body)
+  "Execute body with automatic reconnection on database error"
+  (let ((retry-sym (gensym "RETRY"))
+        (e-sym (gensym "E")))
+    `(block with-db-retry
+       (dotimes (,retry-sym 2)
+         (handler-case
+             (return-from with-db-retry
+               (progn ,@body))
+           (error (,e-sym)
+             (format t "Database error: ~A~%" ,e-sym)
+             (when (= ,retry-sym 0)
+               (if (ensure-db-connection)
+                   (format t "Reconnected, retrying query...~%")
+                   (error "Database reconnection failed"))))))
+       (error "Query failed after reconnection attempt"))))
+
+(defmacro db-execute (query &rest params)
+  "Execute query with automatic reconnection"
+  `(with-db-retry
+     (execute ,query ,@params)))
 
 ;; Query with automatic reconnection
-(defun db-query (query &optional params)
-  (dotimes (retry 2)
-    (handler-case
-        (return-from db-query
-          (if params
-              (postmodern:query query params)
-              (postmodern:query query)))
-      (error (e)
-        (format t "Database error: ~A~%" e)
-        (when (= retry 0)
-          (if (ensure-db-connection)
-              (format t "Reconnected, retrying query...~%")
-              (error "Database reconnection failed"))))))
-  (error "Query failed after reconnection attempt"))
+(defmacro db-query (sql-query &optional params)
+  "Query with automatic reconnection"
+  `(with-db-retry
+     ,(if params
+          `(query ,sql-query ,params)
+          `(query ,sql-query))))
 
 ;; Table creation
 (defun initialize ()
@@ -415,7 +414,9 @@
             (limit (event-field "limit" filter))
             (conditions nil))
         (when limit
-          (setf max-limit (min max-limit limit)))
+          ;; Validate limit is a positive integer
+          (when (and (integerp limit) (> limit 0))
+            (setf max-limit (min max-limit limit))))
         (when kinds
           (if (listp kinds)
               (let ((placeholders (loop for kind in kinds
@@ -462,24 +463,26 @@
                       (push (format nil "$~A = ANY(tagvalues)" param-counter) conditions))))))))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
-    (values filter-conditions (reverse params) max-limit)))
+    ;; Add limit as a parameter
+    (incf param-counter)
+    (push max-limit params)
+    (values filter-conditions (reverse params) param-counter)))
 
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
   (handler-case
       (progn
         ;; Search from PostgreSQL
-        (multiple-value-bind (conditions params max-limit)
+        (multiple-value-bind (conditions params limit-param-num)
             (build-query filters)
           (let* ((where-clause (if conditions
                                    (format nil "WHERE ~{~A~^ OR ~}" conditions)
                                    ""))
-                 (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT ~A" where-clause max-limit)))
+                 (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT $~A" where-clause limit-param-num)))
             (format t "SQL: ~A~%" sql)
             (format t "Params: ~A~%" params)
-            (let ((results (if params
-                               (db-query sql params)
-                               (db-query sql))))
+            (let ((results (with-db-retry
+                             (query sql params))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
