@@ -482,7 +482,14 @@
             (format t "SQL: ~A~%" sql)
             (format t "Params: ~A~%" params)
             (let ((results (with-db-retry
-                             (cl-postgres:exec-query *database* sql 'list-row-reader params))))
+                             (let ((stmt-name (format nil "stmt_~A_~A" 
+                                                      (get-universal-time) 
+                                                      (random 1000000))))
+                               (cl-postgres:prepare-query *database* stmt-name sql)
+                               (unwind-protect
+                                   (cl-postgres:exec-prepared *database* stmt-name params 'list-row-reader)
+                                 (ignore-errors
+                                   (cl-postgres:unprepare-query *database* stmt-name)))))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
