@@ -12,14 +12,13 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :uiop :bordeaux-threads) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
 
 (in-package :cl-user)
 (defpackage nostr-relay
   (:use :cl
         :websocket-driver
-        :postmodern
-        :bt)
+        :postmodern)
   (:export :main))
 (in-package :nostr-relay)
 
@@ -73,17 +72,24 @@
 (defparameter *database-url* nil)
 (defparameter *db-config* nil)
 
-
+;; Database connection
+(defun connect-db ()
+  (connect-toplevel (getf *db-config* :database)
+                    (getf *db-config* :user)
+                    (getf *db-config* :password)
+                    (getf *db-config* :host)
+                    :port (getf *db-config* :port)
+                    :use-ssl :try))
 
 ;; Table creation
 (defun initialize ()
-  (defparameter *database-url* (uiop:getenv "DATABASE_URL"))
+  (defparameter *database-url* (asdf::getenv "DATABASE_URL"))
   (defparameter *db-config*
     (or (parse-database-url *database-url*)
-        (list :database (or (uiop:getenv "DB_NAME") "lisp-nostr-relay")
-              :user (or (uiop:getenv "DB_USER") "postgres")
-              :password (or (uiop:getenv "DB_PASSWORD") "")
-              :host (or (uiop:getenv "DB_HOST") "localhost")
+        (list :database (or (asdf::getenv "DB_NAME") "lisp-nostr-relay")
+              :user (or (asdf::getenv "DB_USER") "postgres")
+              :password (or (asdf::getenv "DB_PASSWORD") "")
+              :host (or (asdf::getenv "DB_HOST") "localhost")
               :port 5432)))
 
   (with-connection (list (getf *db-config* :database)
@@ -115,9 +121,7 @@
       (execute "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues)")))
 
 (defvar *subscriptions* (make-hash-table :test 'equal))
-(defvar *subscriptions-lock* (bt:make-recursive-lock "subscriptions-lock"))
 (defvar *clients* nil)
-(defvar *clients-lock* (bt:make-recursive-lock "clients-lock"))
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -253,65 +257,59 @@
 
 (defun store-event (event)
   "Store event in PostgreSQL"
-  (with-connection (list (getf *db-config* :database)
-                         (getf *db-config* :user)
-                         (getf *db-config* :password)
-                         (getf *db-config* :host)
-                         :port (getf *db-config* :port)
-                         :use-ssl :try)
-    (let ((id (event-field "id" event))
-          (pubkey (event-field "pubkey" event))
-          (created-at (event-field "created_at" event))
-          (kind (event-field "kind" event))
-          (tags-raw (event-field "tags" event))
-          (tags (let ((t-raw (event-field "tags" event)))
-                  (if (null t-raw) (vector) t-raw)))
-          (content (event-field "content" event))
-          (sig (event-field "sig" event)))
-      (when id
-        (handler-case
-            (cond
-              ;; Ephemeral events are not stored
-              ((is-ephemeral kind)
-               (format t "Ephemeral event, not storing: ~A~%" id))
+  (let ((id (event-field "id" event))
+        (pubkey (event-field "pubkey" event))
+        (created-at (event-field "created_at" event))
+        (kind (event-field "kind" event))
+        (tags-raw (event-field "tags" event))
+        (tags (let ((t-raw (event-field "tags" event)))
+                (if (null t-raw) (vector) t-raw)))
+        (content (event-field "content" event))
+        (sig (event-field "sig" event)))
+    (when id
+      (handler-case
+          (cond
+            ;; Ephemeral events are not stored
+            ((is-ephemeral kind)
+             (format t "Ephemeral event, not storing: ~A~%" id))
             
-              ;; Replaceable events: replace if newer
-              ((is-replaceable kind)
-               (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+            ;; Replaceable events: replace if newer
+            ((is-replaceable kind)
+             (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
                       (encode-json-to-string tags)
                       content sig)
-               ;; Delete older events with same pubkey and kind
-               (execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
+             ;; Delete older events with same pubkey and kind
+             (execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
                       pubkey kind created-at))
             
-              ;; Parameterized replaceable events: replace if newer with same d tag
-              ((is-parameterized-replaceable kind)
-               (let ((d-tag (get-d-tag tags)))
-                 (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+            ;; Parameterized replaceable events: replace if newer with same d tag
+            ((is-parameterized-replaceable kind)
+             (let ((d-tag (get-d-tag tags)))
+               (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind 
                         (encode-json-to-string tags)
                         content sig)
-                 ;; Delete older events with same pubkey, kind, and d tag
-                 (execute "DELETE FROM event 
+               ;; Delete older events with same pubkey, kind, and d tag
+               (execute "DELETE FROM event 
                          WHERE pubkey = $1 AND kind = $2 AND created_at < $3
                          AND $4 = ANY(tagvalues)"
                         pubkey kind created-at d-tag)))
             
-              ;; Regular events
-              (t
-               (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+            ;; Regular events
+            (t
+             (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
                       (encode-json-to-string tags)
                       content sig)))
-          (error (e)
-            (format t "Error storing event: ~A~%" e)))))))
+        (error (e)
+          (format t "Error storing event: ~A~%" e))))))
 
 (defun match-filter (event filter)
   "Check if event matches filter"
@@ -328,144 +326,114 @@
     ;; If we get here, all checks passed
     t))
 
-(defun build-query-with-params (filters)
-  "Build SQL query with parameters from filters to prevent SQL injection."
-  (let ((clauses '())
-        (params '())
-        (param-index 1)
+(defun build-query (filters)
+  "Build SQL query from filters"
+  (let ((filter-conditions nil)
         (max-limit 100))
     (dolist (filter filters)
-      (let ((conditions '())
-            (limit (event-field "limit" filter)))
-        (when (and limit (integerp limit))
+      (let ((kinds (event-field "kinds" filter))
+            (authors (event-field "authors" filter))
+            (since (event-field "since" filter))
+            (until (event-field "until" filter))
+            (limit (event-field "limit" filter))
+            (conditions nil))
+        (when limit
           (setf max-limit (min max-limit limit)))
-
-        (let ((kinds (event-field "kinds" filter))
-              (authors (event-field "authors" filter))
-              (since (event-field "since" filter))
-              (until (event-field "until" filter)))
-
-          (when (and kinds (listp kinds))
-            (let ((placeholders (loop for k in kinds
-                                      when (integerp k)
-                                      collect (prog1 (format nil "$~d" param-index)
-                                                (incf param-index)
-                                                (push k params)))))
-              (when placeholders
-                (push (format nil "kind IN (~{~a~^, ~})" placeholders) conditions))))
-
-          (when (and authors (listp authors))
-            (let ((placeholders (loop for a in authors
-                                      when (stringp a)
-                                      collect (prog1 (format nil "$~d" param-index)
-                                                (incf param-index)
-                                                (push a params)))))
-              (when placeholders
-                (push (format nil "pubkey IN (~{~a~^, ~})" placeholders) conditions))))
-
-          (when (and since (integerp since))
-            (push (format nil "created_at >= $~d" param-index) conditions)
-            (incf param-index)
-            (push since params))
-
-          (when (and until (integerp until))
-            (push (format nil "created_at <= $~d" param-index) conditions)
-            (incf param-index)
-            (push until params))
-
-          ;; Handle tag filters (#e, #p, etc.)
-          (dolist (pair filter)
+        (when kinds
+          (if (listp kinds)
+              (let ((kind-list (format nil "~{~A~^,~}" kinds)))
+                (push (format nil "kind IN (~A)" kind-list) conditions))
+              (push (format nil "kind = ~A" kinds) conditions)))
+        (when authors
+          (if (listp authors)
+              (let ((author-list (format nil "~{'~A'~^,~}" authors)))
+                (push (format nil "pubkey IN (~A)" author-list) conditions))
+              (push (format nil "pubkey = '~A'" authors) conditions)))
+        (when since
+          (push (format nil "created_at >= ~A" since) conditions))
+        (when until
+          (push (format nil "created_at <= ~A" until) conditions))
+        ;; Handle tag filters (#e, #p, etc.)
+        (dolist (pair filter)
+          (when (consp pair)
             (let ((key (car pair))
                   (value (cdr pair)))
-              (when (and (stringp key) (> (length key) 1) (char= (char key 0) #\#))
-                (when (listp value)
-                  (dolist (tag-value value)
-                    (when (stringp tag-value)
-                      (push (format nil "$~d = ANY(tagvalues)" param-index) conditions)
-                      (incf param-index)
-                      (push tag-value params)))))))))
-
+              (when (stringp key)
+                (when (and (> (length key) 1) (char= (char key 0) #\#))
+                  (when (and value (listp value))
+                    (dolist (tag-value value)
+                      (push (format nil "'~A' = ANY(tagvalues)" tag-value) conditions))))))))
         (when conditions
-          (push (format nil "(~{~A~^ AND ~})" (nreverse conditions)) clauses))))
-
-    (values (if clauses
-                (format nil "WHERE ~{~A~^ OR ~}" (nreverse clauses))
-                "")
-            (nreverse params)
-            max-limit)))
+          (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
+    (values filter-conditions max-limit)))
 
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
   (handler-case
       (progn
         ;; Search from PostgreSQL
-        (with-connection (list (getf *db-config* :database)
-                               (getf *db-config* :user)
-                               (getf *db-config* :password)
-                               (getf *db-config* :host)
-                               :port (getf *db-config* :port)
-                               :use-ssl :try)
-          (multiple-value-bind (where-clause params max-limit)
-              (build-query-with-params filters)
-            (let* ((sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT ~A" where-clause max-limit)))
-              (format t "SQL: ~A~%" sql)
-              (format t "PARAMS: ~A~%" params)
-              (let ((results (apply #'postmodern:query sql params)))
-                (format t "Results count: ~A~%" (length results))
-                ;; Send matched events
-                (dolist (row results)
-                  (destructuring-bind (id pubkey created-at kind tags content sig) row
-                    (let* ((parsed-tags (cond
-                                          ((null tags) (vector))
-                                          ((stringp tags)
-                                           (handler-case
-                                               (let* ((tag-bytes (babel:string-to-octets tags :encoding :utf-8))
-                                                      (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8))
-                                                      (alist-tags (yason:parse tag-str :object-as :alist)))
-                                                 ;; Convert alist to vector of vectors with all strings
-                                                 (map 'vector 
-                                                      (lambda (tag) 
-                                                        (map 'vector 
-                                                             (lambda (item)
-                                                               (if (stringp item)
-                                                                   item
-                                                                   (format nil "~(~A~)" item)))
-                                                             tag))
-                                                      alist-tags))
-                                             (error (e) 
-                                               (format t "Error parsing tags: ~A~%" e)
-                                               (vector))))
-                                          ((listp tags) 
-                                           (map 'vector 
-                                                (lambda (tag) 
-                                                  (map 'vector 
-                                                       (lambda (item)
-                                                         (if (stringp item)
-                                                             item
-                                                             (format nil "~(~A~)" item)))
-                                                       tag))
-                                                tags))
-                                          (t (vector))))
-                           (event-alist (list (cons "id" id)
-                                              (cons "pubkey" pubkey)
-                                              (cons "created_at" created-at)
-                                              (cons "kind" kind)
-                                              (cons "tags" parsed-tags)
-                                              (cons "content" content)
-                                              (cons "sig" sig)))
-                           (event-hash (let ((ht (make-hash-table :test 'equal)))
-                                         (dolist (pair event-alist)
-                                           (setf (gethash (car pair) ht) (cdr pair)))
-                                         ht)))
-                      (format t "Sending event: ~A~%" id)
-                      (send ws (encode-json-to-string (vector "EVENT" subscription-id event-hash))))))))))))
+        (multiple-value-bind (conditions max-limit)
+            (build-query filters)
+          (let* ((where-clause (if conditions
+                                   (format nil "WHERE ~{~A~^ OR ~}" conditions)
+                                   ""))
+                 (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT ~A" where-clause max-limit)))
+            (format t "SQL: ~A~%" sql)
+            (let ((results (postmodern:query sql)))
+              (format t "Results count: ~A~%" (length results))
+              ;; Send matched events
+              (dolist (row results)
+                (destructuring-bind (id pubkey created-at kind tags content sig) row
+                  (let* ((parsed-tags (cond
+                                        ((null tags) (vector))
+                                        ((stringp tags)
+                                         (handler-case
+                                             (let* ((tag-bytes (babel:string-to-octets tags :encoding :utf-8))
+                                                    (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8))
+                                                    (alist-tags (yason:parse tag-str :object-as :alist)))
+                                               ;; Convert alist to vector of vectors with all strings
+                                               (map 'vector 
+                                                    (lambda (tag) 
+                                                      (map 'vector 
+                                                           (lambda (item)
+                                                             (if (stringp item)
+                                                                 item
+                                                                 (format nil "~(~A~)" item)))
+                                                           tag))
+                                                    alist-tags))
+                                           (error (e) 
+                                             (format t "Error parsing tags: ~A~%" e)
+                                             (vector))))
+                                        ((listp tags) 
+                                         (map 'vector 
+                                              (lambda (tag) 
+                                                (map 'vector 
+                                                     (lambda (item)
+                                                       (if (stringp item)
+                                                           item
+                                                           (format nil "~(~A~)" item)))
+                                                     tag))
+                                              tags))
+                                        (t (vector))))
+                         (event-alist (list (cons "id" id)
+                                            (cons "pubkey" pubkey)
+                                            (cons "created_at" created-at)
+                                            (cons "kind" kind)
+                                            (cons "tags" parsed-tags)
+                                            (cons "content" content)
+                                            (cons "sig" sig)))
+                         (event-hash (let ((ht (make-hash-table :test 'equal)))
+                                       (dolist (pair event-alist)
+                                         (setf (gethash (car pair) ht) (cdr pair)))
+                                       ht)))
+                    (format t "Sending event: ~A~%" id)
+                    (send ws (encode-json-to-string (vector "EVENT" subscription-id event-hash)))))))))
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
         (send ws (encode-json-to-string (vector "EOSE" subscription-id)))
         ;; Save subscription
-        (with-recursive-lock-held (*subscriptions-lock*)
-          (setf (gethash subscription-id *subscriptions*)
-                (list :ws ws :filters filters))))
+        (setf (gethash subscription-id *subscriptions*)
+              (list :ws ws :filters filters)))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
       (send ws (encode-json-to-string (vector "EOSE" subscription-id))))))
@@ -500,19 +468,18 @@
             (format t "Sending OK for event: ~A~%" event-id)
             (send ws (encode-json-to-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
-          (with-recursive-lock-held (*subscriptions-lock*)
-            (maphash (lambda (sub-id sub-info)
-                       (let ((sub-ws (getf sub-info :ws))
-                             (filters (getf sub-info :filters)))
-                         ;; Check if event matches any filter
-                         (when (some (lambda (filter) (match-filter event filter)) filters)
-                           (format t "Broadcasting event to subscription: ~A~%" sub-id)
-                           ;; Convert alist to hash table for encoding
-                           (let ((event-hash (make-hash-table :test 'equal)))
-                             (dolist (pair event)
-                               (setf (gethash (car pair) event-hash) (cdr pair)))
-                             (send sub-ws (encode-json-to-string (vector "EVENT" sub-id event-hash)))))))
-                     *subscriptions*)))
+          (maphash (lambda (sub-id sub-info)
+                     (let ((sub-ws (getf sub-info :ws))
+                           (filters (getf sub-info :filters)))
+                       ;; Check if event matches any filter
+                       (when (some (lambda (filter) (match-filter event filter)) filters)
+                         (format t "Broadcasting event to subscription: ~A~%" sub-id)
+                         ;; Convert alist to hash table for encoding
+                         (let ((event-hash (make-hash-table :test 'equal)))
+                           (dolist (pair event)
+                             (setf (gethash (car pair) event-hash) (cdr pair)))
+                           (send sub-ws (encode-json-to-string (vector "EVENT" sub-id event-hash)))))))
+                   *subscriptions*))
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (format t "Event verification failed: ~A~%" event-id)
@@ -520,8 +487,7 @@
 
 (defun handle-close (subscription-id)
   "Handle CLOSE message"
-  (with-recursive-lock-held (*subscriptions-lock*)
-    (remhash subscription-id *subscriptions*)))
+  (remhash subscription-id *subscriptions*))
 
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
@@ -564,8 +530,7 @@
           (if (and upgrade (string-equal upgrade "websocket"))
               ;; WebSocket connection
               (let ((ws (make-server env)))
-                (with-recursive-lock-held (*clients-lock*)
-                  (push ws *clients*))
+                (push ws *clients*)
                 (on :message ws
                     (lambda (message)
                       (handler-case
@@ -576,14 +541,12 @@
                 (on :close ws
                     (lambda (&key code reason)
                       (declare (ignore code reason))
-                      (with-recursive-lock-held (*clients-lock*)
-                        (setf *clients* (remove ws *clients*)))
+                      (setf *clients* (remove ws *clients*))
                       ;; Remove subscriptions for this client
-                      (with-recursive-lock-held (*subscriptions-lock*)
-                        (maphash (lambda (sub-id sub-info)
-                                   (when (eq (getf sub-info :ws) ws)
-                                     (remhash sub-id *subscriptions*)))
-                                 *subscriptions*))))
+                      (maphash (lambda (sub-id sub-info)
+                                 (when (eq (getf sub-info :ws) ws)
+                                   (remhash sub-id *subscriptions*)))
+                               *subscriptions*)))
                 (lambda (responder)
                   (declare (ignore responder))
                   (start-connection ws)))
@@ -591,12 +554,12 @@
               (cond
                 ;; NIP-11 relay information
                 ((and accept (search "application/nostr+json" accept))
-                 (let* ((relay-name (or (uiop:getenv "RELAY_NAME") "Lisp Nostr Relay"))
-                        (relay-description (or (uiop:getenv "RELAY_DESCRIPTION") 
+                 (let* ((relay-name (or (asdf::getenv "RELAY_NAME") "Lisp Nostr Relay"))
+                        (relay-description (or (asdf::getenv "RELAY_DESCRIPTION") 
                                                "A lightweight Nostr relay implementation in Common Lisp"))
-                        (relay-pubkey (or (uiop:getenv "RELAY_PUBKEY") ""))
-                        (relay-contact (or (uiop:getenv "RELAY_CONTACT") ""))
-                        (relay-icon (or (uiop:getenv "RELAY_ICON") ""))
+                        (relay-pubkey (or (asdf::getenv "RELAY_PUBKEY") ""))
+                        (relay-contact (or (asdf::getenv "RELAY_CONTACT") ""))
+                        (relay-icon (or (asdf::getenv "RELAY_ICON") ""))
                         (info (make-hash-table :test 'equal)))
                    (setf (gethash "name" info) relay-name)
                    (setf (gethash "description" info) relay-description)
@@ -658,12 +621,13 @@
 (defun main ()
   ;; Database initialization and server startup
   (initialize)
+  (connect-db)
   (setf *public-path* (merge-pathnames "public/" 
                                        (or *load-pathname* 
                                            *compile-file-pathname*
                                            (truename ".")
                                            #p"/app/")))
-  (let ((port (parse-integer (or (uiop:getenv "PORT") "5000"))))
+  (let ((port (parse-integer (or (asdf::getenv "PORT") "5000"))))
     (format t "Static files path: ~A~%" *public-path*)
     (format t "Starting server on 0.0.0.0:~A~%" port)
     (force-output)
