@@ -12,7 +12,7 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :bordeaux-threads) :silent t)
 
 ;; Try to load secp256k1 if available
 (handler-case
@@ -25,6 +25,9 @@
   (:use :cl
         :websocket-driver
         :postmodern)
+  (:import-from :bordeaux-threads
+                :make-lock
+                :with-lock-held)
   (:export :main))
 (in-package :nostr-relay)
 
@@ -77,15 +80,82 @@
 ;; PostgreSQL connection configuration
 (defparameter *database-url* nil)
 (defparameter *db-config* nil)
+(defparameter *db-connection-lock* (bordeaux-threads:make-lock "db-connection"))
+(defparameter *db-max-retries* 3)
+(defparameter *db-retry-delay* 5)
 
 ;; Database connection
 (defun connect-db ()
-  (connect-toplevel (getf *db-config* :database)
-                    (getf *db-config* :user)
-                    (getf *db-config* :password)
-                    (getf *db-config* :host)
-                    :port (getf *db-config* :port)
-                    :use-ssl :try))
+  (bordeaux-threads:with-lock-held (*db-connection-lock*)
+    (handler-case
+        (progn
+          (format t "Connecting to database...~%")
+          (connect-toplevel (getf *db-config* :database)
+                            (getf *db-config* :user)
+                            (getf *db-config* :password)
+                            (getf *db-config* :host)
+                            :port (getf *db-config* :port)
+                            :use-ssl :try)
+          (format t "Database connected successfully~%")
+          t)
+      (error (e)
+        (format t "Error connecting to database: ~A~%" e)
+        nil))))
+
+;; Check if database connection is alive
+(defun db-connected-p ()
+  (handler-case
+      (progn
+        (query "SELECT 1" :single)
+        t)
+    (error () nil)))
+
+;; Reconnect to database with retry logic
+(defun ensure-db-connection ()
+  (unless (db-connected-p)
+    (format t "Database connection lost, attempting to reconnect...~%")
+    (disconnect-toplevel)
+    (dotimes (i *db-max-retries*)
+      (format t "Reconnection attempt ~A/~A~%" (1+ i) *db-max-retries*)
+      (when (connect-db)
+        (return-from ensure-db-connection t))
+      (unless (= i (1- *db-max-retries*))
+        (format t "Waiting ~A seconds before retry...~%" *db-retry-delay*)
+        (sleep *db-retry-delay*)))
+    (format t "Failed to reconnect after ~A attempts~%" *db-max-retries*)
+    nil))
+
+;; Execute query with automatic reconnection
+(defun db-execute (query &rest params)
+  (dotimes (retry 2)
+    (handler-case
+        (return-from db-execute
+          (if params
+              (apply #'execute query params)
+              (execute query)))
+      (error (e)
+        (format t "Database error: ~A~%" e)
+        (when (= retry 0)
+          (if (ensure-db-connection)
+              (format t "Reconnected, retrying query...~%")
+              (error "Database reconnection failed"))))))
+  (error "Query failed after reconnection attempt"))
+
+;; Query with automatic reconnection
+(defun db-query (query &optional params)
+  (dotimes (retry 2)
+    (handler-case
+        (return-from db-query
+          (if params
+              (postmodern:query query params)
+              (postmodern:query query)))
+      (error (e)
+        (format t "Database error: ~A~%" e)
+        (when (= retry 0)
+          (if (ensure-db-connection)
+              (format t "Reconnected, retrying query...~%")
+              (error "Database reconnection failed"))))))
+  (error "Query failed after reconnection attempt"))
 
 ;; Table creation
 (defun initialize ()
@@ -104,12 +174,12 @@
                          (getf *db-config* :host)
                          :port (getf *db-config* :port)
                          :use-ssl :try)
-      (execute "CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
+      (db-execute "CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
                 AS 'SELECT array_agg(t->>1) FROM (SELECT jsonb_array_elements($1) AS t)s WHERE length(t->>0) = 1;'
                 LANGUAGE SQL
                 IMMUTABLE
                 RETURNS NULL ON NULL INPUT")
-      (execute "CREATE TABLE IF NOT EXISTS event (
+      (db-execute "CREATE TABLE IF NOT EXISTS event (
                 id text NOT NULL,
                 pubkey text NOT NULL,
                 created_at integer NOT NULL,
@@ -119,12 +189,12 @@
                 sig text NOT NULL,
                 tagvalues text[] GENERATED ALWAYS AS (tags_to_tagvalues(tags)) STORED
               )")
-      (execute "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops)")
-      (execute "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event USING btree (pubkey text_pattern_ops)")
-      (execute "CREATE INDEX IF NOT EXISTS timeidx ON event (created_at DESC)")
-      (execute "CREATE INDEX IF NOT EXISTS kindidx ON event (kind)")
-      (execute "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC)")
-      (execute "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues)")))
+      (db-execute "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops)")
+      (db-execute "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event USING btree (pubkey text_pattern_ops)")
+      (db-execute "CREATE INDEX IF NOT EXISTS timeidx ON event (created_at DESC)")
+      (db-execute "CREATE INDEX IF NOT EXISTS kindidx ON event (kind)")
+      (db-execute "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC)")
+      (db-execute "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues)")))
 
 (defvar *subscriptions* (make-hash-table :test 'equal))
 (defvar *clients* nil)
@@ -280,34 +350,34 @@
             
             ;; Replaceable events: replace if newer
             ((is-replaceable kind)
-             (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+             (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
                       (encode-json-to-string tags)
                       content sig)
              ;; Delete older events with same pubkey and kind
-             (execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
+             (db-execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
                       pubkey kind created-at))
             
             ;; Parameterized replaceable events: replace if newer with same d tag
             ((is-parameterized-replaceable kind)
              (let ((d-tag (get-d-tag tags)))
-               (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+               (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind 
                         (encode-json-string tags)
                         content sig)
                ;; Delete older events with same pubkey, kind, and d tag
-               (execute "DELETE FROM event 
+               (db-execute "DELETE FROM event 
                          WHERE pubkey = $1 AND kind = $2 AND created_at < $3
                          AND $4 = ANY(tagvalues)"
                         pubkey kind created-at d-tag)))
             
             ;; Regular events
             (t
-             (execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+             (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
@@ -408,8 +478,8 @@
             (format t "SQL: ~A~%" sql)
             (format t "Params: ~A~%" params)
             (let ((results (if params
-                               (postmodern:query sql params)
-                               (postmodern:query sql))))
+                               (db-query sql params)
+                               (db-query sql))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
