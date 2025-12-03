@@ -487,7 +487,7 @@
                                                       (random 1000000))))
                                (cl-postgres:prepare-query *database* stmt-name sql)
                                (unwind-protect
-                                   (cl-postgres:exec-prepared *database* stmt-name params 'list-row-reader)
+                                   (cl-postgres:exec-prepared *database* stmt-name params 'cl-postgres:list-row-reader)
                                  (ignore-errors
                                    (cl-postgres:unprepare-query *database* stmt-name)))))))
               (format t "Results count: ~A~%" (length results))
