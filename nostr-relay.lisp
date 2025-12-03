@@ -14,6 +14,12 @@
 
 (ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1) :silent t)
 
+;; Try to load secp256k1 if available
+(handler-case
+    (ql:quickload :secp256k1 :silent t)
+  (error (e)
+    (format t "Warning: secp256k1 not available, signature verification disabled: ~A~%" e)))
+
 (in-package :cl-user)
 (defpackage nostr-relay
   (:use :cl
@@ -83,13 +89,13 @@
 
 ;; Table creation
 (defun initialize ()
-  (defparameter *database-url* (asdf::getenv "DATABASE_URL"))
+  (defparameter *database-url* (uiop:getenv "DATABASE_URL"))
   (defparameter *db-config*
     (or (parse-database-url *database-url*)
-        (list :database (or (asdf::getenv "DB_NAME") "lisp-nostr-relay")
-              :user (or (asdf::getenv "DB_USER") "postgres")
-              :password (or (asdf::getenv "DB_PASSWORD") "")
-              :host (or (asdf::getenv "DB_HOST") "localhost")
+        (list :database (or (uiop:getenv "DB_NAME") "lisp-nostr-relay")
+              :user (or (uiop:getenv "DB_USER") "postgres")
+              :password (or (uiop:getenv "DB_PASSWORD") "")
+              :host (or (uiop:getenv "DB_HOST") "localhost")
               :port 5432)))
 
   (with-connection (list (getf *db-config* :database)
@@ -137,7 +143,7 @@
         (cdr (assoc field event :test #'equal)))))
 
 ;; Helper function to encode JSON with yason (supports raw UTF-8)
-(defun encode-json-to-string (obj)
+(defun encode-json-string (obj)
   "Encode object to JSON string using yason (supports raw UTF-8)"
   (with-output-to-string (s)
     (yason:encode obj s)))
@@ -158,7 +164,7 @@
          (tags-raw (event-field "tags" event))
          (tags (if (null tags-raw) (vector) tags-raw))
          (content (event-field "content" event))
-         (serialized (encode-json-to-string 
+         (serialized (encode-json-string 
                       (list 0 pubkey created-at kind tags content))))
     (sha256-hex serialized)))
 
@@ -261,7 +267,6 @@
         (pubkey (event-field "pubkey" event))
         (created-at (event-field "created_at" event))
         (kind (event-field "kind" event))
-        (tags-raw (event-field "tags" event))
         (tags (let ((t-raw (event-field "tags" event)))
                 (if (null t-raw) (vector) t-raw)))
         (content (event-field "content" event))
@@ -292,7 +297,7 @@
                          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind 
-                        (encode-json-to-string tags)
+                        (encode-json-string tags)
                         content sig)
                ;; Delete older events with same pubkey, kind, and d tag
                (execute "DELETE FROM event 
@@ -306,7 +311,7 @@
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind 
-                      (encode-json-to-string tags)
+                      (encode-json-string tags)
                       content sig)))
         (error (e)
           (format t "Error storing event: ~A~%" e))))))
@@ -327,8 +332,10 @@
     t))
 
 (defun build-query (filters)
-  "Build SQL query from filters"
+  "Build SQL query from filters with parameterized queries"
   (let ((filter-conditions nil)
+        (params nil)
+        (param-counter 0)
         (max-limit 100))
     (dolist (filter filters)
       (let ((kinds (event-field "kinds" filter))
@@ -341,18 +348,36 @@
           (setf max-limit (min max-limit limit)))
         (when kinds
           (if (listp kinds)
-              (let ((kind-list (format nil "~{~A~^,~}" kinds)))
-                (push (format nil "kind IN (~A)" kind-list) conditions))
-              (push (format nil "kind = ~A" kinds) conditions)))
+              (let ((placeholders (loop for kind in kinds
+                                        collect (progn
+                                                  (incf param-counter)
+                                                  (push kind params)
+                                                  (format nil "$~A" param-counter)))))
+                (push (format nil "kind IN (~{~A~^,~})" placeholders) conditions))
+              (progn
+                (incf param-counter)
+                (push kinds params)
+                (push (format nil "kind = $~A" param-counter) conditions))))
         (when authors
           (if (listp authors)
-              (let ((author-list (format nil "~{'~A'~^,~}" authors)))
-                (push (format nil "pubkey IN (~A)" author-list) conditions))
-              (push (format nil "pubkey = '~A'" authors) conditions)))
+              (let ((placeholders (loop for author in authors
+                                        collect (progn
+                                                  (incf param-counter)
+                                                  (push author params)
+                                                  (format nil "$~A" param-counter)))))
+                (push (format nil "pubkey IN (~{~A~^,~})" placeholders) conditions))
+              (progn
+                (incf param-counter)
+                (push authors params)
+                (push (format nil "pubkey = $~A" param-counter) conditions))))
         (when since
-          (push (format nil "created_at >= ~A" since) conditions))
+          (incf param-counter)
+          (push since params)
+          (push (format nil "created_at >= $~A" param-counter) conditions))
         (when until
-          (push (format nil "created_at <= ~A" until) conditions))
+          (incf param-counter)
+          (push until params)
+          (push (format nil "created_at <= $~A" param-counter) conditions))
         ;; Handle tag filters (#e, #p, etc.)
         (dolist (pair filter)
           (when (consp pair)
@@ -362,24 +387,29 @@
                 (when (and (> (length key) 1) (char= (char key 0) #\#))
                   (when (and value (listp value))
                     (dolist (tag-value value)
-                      (push (format nil "'~A' = ANY(tagvalues)" tag-value) conditions))))))))
+                      (incf param-counter)
+                      (push tag-value params)
+                      (push (format nil "$~A = ANY(tagvalues)" param-counter) conditions))))))))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
-    (values filter-conditions max-limit)))
+    (values filter-conditions (reverse params) max-limit)))
 
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
   (handler-case
       (progn
         ;; Search from PostgreSQL
-        (multiple-value-bind (conditions max-limit)
+        (multiple-value-bind (conditions params max-limit)
             (build-query filters)
           (let* ((where-clause (if conditions
                                    (format nil "WHERE ~{~A~^ OR ~}" conditions)
                                    ""))
                  (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT ~A" where-clause max-limit)))
             (format t "SQL: ~A~%" sql)
-            (let ((results (postmodern:query sql)))
+            (format t "Params: ~A~%" params)
+            (let ((results (if params
+                               (postmodern:query sql params)
+                               (postmodern:query sql))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
@@ -427,16 +457,16 @@
                                          (setf (gethash (car pair) ht) (cdr pair)))
                                        ht)))
                     (format t "Sending event: ~A~%" id)
-                    (send ws (encode-json-to-string (vector "EVENT" subscription-id event-hash)))))))))
+                    (send ws (encode-json-string (vector "EVENT" subscription-id event-hash)))))))))
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
-        (send ws (encode-json-to-string (vector "EOSE" subscription-id)))
+        (send ws (encode-json-string (vector "EOSE" subscription-id)))
         ;; Save subscription
         (setf (gethash subscription-id *subscriptions*)
               (list :ws ws :filters filters)))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
-      (send ws (encode-json-to-string (vector "EOSE" subscription-id))))))
+      (send ws (encode-json-string (vector "EOSE" subscription-id))))))
 
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
@@ -456,7 +486,7 @@
     (when (has-protected-tag event)
       (let ((event-id (event-field "id" event)))
         (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
-        (send ws (encode-json-to-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
+        (send ws (encode-json-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
@@ -466,7 +496,7 @@
           ;; Send OK response
           (let ((event-id (event-field "id" event)))
             (format t "Sending OK for event: ~A~%" event-id)
-            (send ws (encode-json-to-string (vector "OK" event-id t ""))))
+            (send ws (encode-json-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
           (maphash (lambda (sub-id sub-info)
                      (let ((sub-ws (getf sub-info :ws))
@@ -478,12 +508,12 @@
                          (let ((event-hash (make-hash-table :test 'equal)))
                            (dolist (pair event)
                              (setf (gethash (car pair) event-hash) (cdr pair)))
-                           (send sub-ws (encode-json-to-string (vector "EVENT" sub-id event-hash)))))))
+                           (send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash)))))))
                    *subscriptions*))
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (format t "Event verification failed: ~A~%" event-id)
-          (send ws (encode-json-to-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
+          (send ws (encode-json-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id)
   "Handle CLOSE message"
@@ -554,12 +584,12 @@
               (cond
                 ;; NIP-11 relay information
                 ((and accept (search "application/nostr+json" accept))
-                 (let* ((relay-name (or (asdf::getenv "RELAY_NAME") "Lisp Nostr Relay"))
-                        (relay-description (or (asdf::getenv "RELAY_DESCRIPTION") 
+                 (let* ((relay-name (or (uiop:getenv "RELAY_NAME") "Lisp Nostr Relay"))
+                        (relay-description (or (uiop:getenv "RELAY_DESCRIPTION") 
                                                "A lightweight Nostr relay implementation in Common Lisp"))
-                        (relay-pubkey (or (asdf::getenv "RELAY_PUBKEY") ""))
-                        (relay-contact (or (asdf::getenv "RELAY_CONTACT") ""))
-                        (relay-icon (or (asdf::getenv "RELAY_ICON") ""))
+                        (relay-pubkey (or (uiop:getenv "RELAY_PUBKEY") ""))
+                        (relay-contact (or (uiop:getenv "RELAY_CONTACT") ""))
+                        (relay-icon (or (uiop:getenv "RELAY_ICON") ""))
                         (info (make-hash-table :test 'equal)))
                    (setf (gethash "name" info) relay-name)
                    (setf (gethash "description" info) relay-description)
@@ -591,7 +621,7 @@
                                :access-control-allow-origin "*"
                                :access-control-allow-headers "Content-Type"
                                :access-control-allow-methods "GET")
-                         (list (encode-json-to-string info)))))
+                         (list (encode-json-string info)))))
                 ;; Static files
                 (t
                  (handler-case
@@ -627,7 +657,7 @@
                                            *compile-file-pathname*
                                            (truename ".")
                                            #p"/app/")))
-  (let ((port (parse-integer (or (asdf::getenv "PORT") "5000"))))
+  (let ((port (parse-integer (or (uiop:getenv "PORT") "5000"))))
     (format t "Static files path: ~A~%" *public-path*)
     (format t "Starting server on 0.0.0.0:~A~%" port)
     (force-output)
