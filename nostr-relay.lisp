@@ -81,6 +81,7 @@
 (defparameter *database-url* nil)
 (defparameter *db-config* nil)
 (defparameter *db-connection-lock* (bordeaux-threads:make-lock "db-connection"))
+(defparameter *db-query-lock* (bordeaux-threads:make-lock "db-query"))
 (defparameter *db-max-retries* 3)
 (defparameter *db-retry-delay* 5)
 
@@ -481,15 +482,16 @@
                  (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT $~A" where-clause limit-param-num)))
             (format t "SQL: ~A~%" sql)
             (format t "Params: ~A~%" params)
-            (let ((results (with-db-retry
-                             (let ((stmt-name (format nil "stmt_~A_~A" 
-                                                      (get-universal-time) 
-                                                      (random 1000000))))
-                               (cl-postgres:prepare-query *database* stmt-name sql)
-                               (unwind-protect
-                                   (cl-postgres:exec-prepared *database* stmt-name params 'cl-postgres:list-row-reader)
-                                 (ignore-errors
-                                   (cl-postgres:unprepare-query *database* stmt-name)))))))
+            (let ((results (bordeaux-threads:with-lock-held (*db-query-lock*)
+                             (with-db-retry
+                               (let ((stmt-name (format nil "stmt_~A_~A" 
+                                                        (get-universal-time) 
+                                                        (random 1000000))))
+                                 (cl-postgres:prepare-query *database* stmt-name sql)
+                                 (unwind-protect
+                                     (cl-postgres:exec-prepared *database* stmt-name params 'cl-postgres:list-row-reader)
+                                   (ignore-errors
+                                     (cl-postgres:unprepare-query *database* stmt-name))))))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
@@ -541,9 +543,11 @@
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
         (send ws (encode-json-string (vector "EOSE" subscription-id)))
-        ;; Save subscription
-        (setf (gethash subscription-id *subscriptions*)
-              (list :ws ws :filters filters)))
+        ;; Save subscription (support multiple clients with same sub-id)
+        (let ((existing (gethash subscription-id *subscriptions*)))
+          (setf (gethash subscription-id *subscriptions*)
+                (cons (list :ws ws :filters filters) 
+                      (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing)))))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
       (send ws (encode-json-string (vector "EOSE" subscription-id))))))
@@ -578,26 +582,31 @@
             (format t "Sending OK for event: ~A~%" event-id)
             (send ws (encode-json-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
-          (maphash (lambda (sub-id sub-info)
-                     (let ((sub-ws (getf sub-info :ws))
-                           (filters (getf sub-info :filters)))
-                       ;; Check if event matches any filter
-                       (when (some (lambda (filter) (match-filter event filter)) filters)
-                         (format t "Broadcasting event to subscription: ~A~%" sub-id)
-                         ;; Convert alist to hash table for encoding
-                         (let ((event-hash (make-hash-table :test 'equal)))
-                           (dolist (pair event)
-                             (setf (gethash (car pair) event-hash) (cdr pair)))
-                           (send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash)))))))
+          (maphash (lambda (sub-id sub-list)
+                     (dolist (sub-info sub-list)
+                       (let ((sub-ws (getf sub-info :ws))
+                             (filters (getf sub-info :filters)))
+                         ;; Check if event matches any filter
+                         (when (some (lambda (filter) (match-filter event filter)) filters)
+                           (format t "Broadcasting event to subscription: ~A~%" sub-id)
+                           ;; Convert alist to hash table for encoding
+                           (let ((event-hash (make-hash-table :test 'equal)))
+                             (dolist (pair event)
+                               (setf (gethash (car pair) event-hash) (cdr pair)))
+                             (send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash))))))))
                    *subscriptions*))
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (format t "Event verification failed: ~A~%" event-id)
           (send ws (encode-json-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
 
-(defun handle-close (subscription-id)
+(defun handle-close (subscription-id ws)
   "Handle CLOSE message"
-  (remhash subscription-id *subscriptions*))
+  (let ((existing (gethash subscription-id *subscriptions*)))
+    (setf (gethash subscription-id *subscriptions*)
+          (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing))
+    (when (null (gethash subscription-id *subscriptions*))
+      (remhash subscription-id *subscriptions*))))
 
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
@@ -622,7 +631,7 @@
               ((equal type "CLOSE")
                (when (>= (length msg) 2)
                  (format t "Handling CLOSE~%")
-                 (handle-close (second msg))))))))
+                 (handle-close (second msg) ws)))))))
     (error (e)
       (format t "Error processing message: ~A~%" e))))
 
@@ -653,9 +662,11 @@
                       (declare (ignore code reason))
                       (setf *clients* (remove ws *clients*))
                       ;; Remove subscriptions for this client
-                      (maphash (lambda (sub-id sub-info)
-                                 (when (eq (getf sub-info :ws) ws)
-                                   (remhash sub-id *subscriptions*)))
+                      (maphash (lambda (sub-id sub-list)
+                                 (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
+                                   (if updated-list
+                                       (setf (gethash sub-id *subscriptions*) updated-list)
+                                       (remhash sub-id *subscriptions*))))
                                *subscriptions*)))
                 (lambda (responder)
                   (declare (ignore responder))
