@@ -1,2 +1,5 @@
 setenv.sh
+update.sh
 kustomize
+CRUSH.md
+.aider*
