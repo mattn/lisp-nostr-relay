@@ -476,7 +476,7 @@
     ;; Add limit
     (incf param-num)
     (push max-limit all-params)
-    (values filter-conditions (reverse all-params) param-num))))
+    (values filter-conditions (reverse all-params) param-num)))
 
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
