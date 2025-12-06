@@ -1,3 +1,12 @@
+(declaim (sb-ext:muffle-conditions style-warning warning))
+(sb-ext:disable-debugger)
+
+#+sbcl
+(sb-sys:enable-interrupt sb-unix:sigint
+                        (lambda (&rest args)
+                          (declare (ignore args))
+                          (sb-ext:quit :unix-status 130)))
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (let* ((home (or (user-homedir-pathname) (pathname "/root/")))
          (ql-local   (merge-pathnames "setup.lisp" (merge-pathnames ".quicklisp/" home)))
@@ -198,6 +207,7 @@
 
 (defvar *subscriptions* (make-hash-table :test 'equal))
 (defvar *clients* nil)
+(defvar *clients-lock* (bordeaux-threads:make-lock "clients"))
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -484,14 +494,7 @@
             (format t "Params: ~A~%" params)
             (let ((results (bordeaux-threads:with-lock-held (*db-query-lock*)
                              (with-db-retry
-                               (let ((stmt-name (format nil "stmt_~A_~A" 
-                                                        (get-universal-time) 
-                                                        (random 1000000))))
-                                 (cl-postgres:prepare-query *database* stmt-name sql)
-                                 (unwind-protect
-                                     (cl-postgres:exec-prepared *database* stmt-name params 'cl-postgres:list-row-reader)
-                                   (ignore-errors
-                                     (cl-postgres:unprepare-query *database* stmt-name))))))))
+                               (query sql params)))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
@@ -649,7 +652,8 @@
           (if (and upgrade (string-equal upgrade "websocket"))
               ;; WebSocket connection
               (let ((ws (make-server env)))
-                (push ws *clients*)
+                (bordeaux-threads:with-lock-held (*clients-lock*)
+                  (push ws *clients*))
                 (on :message ws
                     (lambda (message)
                       (handler-case
@@ -660,14 +664,17 @@
                 (on :close ws
                     (lambda (&key code reason)
                       (declare (ignore code reason))
-                      (setf *clients* (remove ws *clients*))
+                      (bordeaux-threads:with-lock-held (*clients-lock*)
+                        (setf *clients* (remove ws *clients*)))
                       ;; Remove subscriptions for this client
                       (maphash (lambda (sub-id sub-list)
                                  (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
                                    (if updated-list
                                        (setf (gethash sub-id *subscriptions*) updated-list)
                                        (remhash sub-id *subscriptions*))))
-                               *subscriptions*)))
+                               *subscriptions*)
+                      ;; Force garbage collection
+                      (sb-ext:gc :full t)))
                 (lambda (responder)
                   (declare (ignore responder))
                   (start-connection ws)))
@@ -739,6 +746,33 @@
         (force-output)
         '(500 (:content-type "text/plain") ("Internal Server Error"))))))
 
+(defun cleanup-thread ()
+  "Periodic cleanup thread to prevent memory leaks"
+  (loop
+    (sleep 300) ; 5 minutes
+    (handler-case
+        (progn
+          ;; Clean up dead WebSocket connections
+          (bordeaux-threads:with-lock-held (*clients-lock*)
+            (setf *clients* (remove-if-not #'websocket-driver:ready-state *clients*)))
+          ;; Clean up orphaned subscriptions
+          (let ((active-ws (bordeaux-threads:with-lock-held (*clients-lock*)
+                             (copy-list *clients*))))
+            (maphash (lambda (sub-id sub-list)
+                       (let ((valid-subs (remove-if-not 
+                                           (lambda (sub) 
+                                             (member (getf sub :ws) active-ws))
+                                           sub-list)))
+                         (if valid-subs
+                             (setf (gethash sub-id *subscriptions*) valid-subs)
+                             (remhash sub-id *subscriptions*))))
+                     *subscriptions*))
+          ;; Force garbage collection
+          (sb-ext:gc :full t)
+          (format t "Cleanup completed at ~A~%" (get-universal-time)))
+      (error (e)
+        (format t "Error in cleanup thread: ~A~%" e)))))
+
 (defun main ()
   ;; Database initialization and server startup
   (initialize)
@@ -748,10 +782,11 @@
                                            *compile-file-pathname*
                                            (truename ".")
                                            #p"/app/")))
+  ;; Start cleanup thread
+  (bordeaux-threads:make-thread #'cleanup-thread :name "cleanup-thread")
   (let ((port (parse-integer (or (uiop:getenv "PORT") "5000"))))
     (format t "Static files path: ~A~%" *public-path*)
     (format t "Starting server on 0.0.0.0:~A~%" port)
     (force-output)
     (clack:clackup *app* :server *handler* :address "0.0.0.0" :port port :use-thread t)
     (loop (sleep 1))))
-
