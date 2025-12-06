@@ -414,8 +414,8 @@
 (defun build-query (filters)
   "Build SQL query from filters with parameterized queries"
   (let ((filter-conditions nil)
-        (params nil)
-        (param-counter 0)
+        (all-params nil)
+        (param-num 0)
         (max-limit 100))
     (dolist (filter filters)
       (let ((kinds (event-field "kinds" filter))
@@ -425,42 +425,41 @@
             (limit (event-field "limit" filter))
             (conditions nil))
         (when limit
-          ;; Validate limit is a positive integer
           (when (and (integerp limit) (> limit 0))
             (setf max-limit (min max-limit limit))))
         (when kinds
           (if (listp kinds)
-              (let ((placeholders (loop for kind in kinds
-                                        collect (progn
-                                                  (incf param-counter)
-                                                  (push kind params)
-                                                  (format nil "$~A" param-counter)))))
-                (push (format nil "kind IN (~{~A~^,~})" placeholders) conditions))
+              (let ((placeholders nil))
+                (dolist (kind kinds)
+                  (incf param-num)
+                  (push kind all-params)
+                  (push (format nil "$~A" param-num) placeholders))
+                (push (format nil "kind IN (~{~A~^,~})" (reverse placeholders)) conditions))
               (progn
-                (incf param-counter)
-                (push kinds params)
-                (push (format nil "kind = $~A" param-counter) conditions))))
+                (incf param-num)
+                (push kinds all-params)
+                (push (format nil "kind = $~A" param-num) conditions))))
         (when authors
           (if (listp authors)
-              (let ((placeholders (loop for author in authors
-                                        collect (progn
-                                                  (incf param-counter)
-                                                  (push author params)
-                                                  (format nil "$~A" param-counter)))))
-                (push (format nil "pubkey IN (~{~A~^,~})" placeholders) conditions))
+              (let ((placeholders nil))
+                (dolist (author authors)
+                  (incf param-num)
+                  (push author all-params)
+                  (push (format nil "$~A" param-num) placeholders))
+                (push (format nil "pubkey IN (~{~A~^,~})" (reverse placeholders)) conditions))
               (progn
-                (incf param-counter)
-                (push authors params)
-                (push (format nil "pubkey = $~A" param-counter) conditions))))
+                (incf param-num)
+                (push authors all-params)
+                (push (format nil "pubkey = $~A" param-num) conditions))))
         (when since
-          (incf param-counter)
-          (push since params)
-          (push (format nil "created_at >= $~A" param-counter) conditions))
+          (incf param-num)
+          (push since all-params)
+          (push (format nil "created_at >= $~A" param-num) conditions))
         (when until
-          (incf param-counter)
-          (push until params)
-          (push (format nil "created_at <= $~A" param-counter) conditions))
-        ;; Handle tag filters (#e, #p, etc.)
+          (incf param-num)
+          (push until all-params)
+          (push (format nil "created_at <= $~A" param-num) conditions))
+        ;; Handle tag filters
         (dolist (pair filter)
           (when (consp pair)
             (let ((key (car pair))
@@ -469,15 +468,15 @@
                 (when (and (> (length key) 1) (char= (char key 0) #\#))
                   (when (and value (listp value))
                     (dolist (tag-value value)
-                      (incf param-counter)
-                      (push tag-value params)
-                      (push (format nil "$~A = ANY(tagvalues)" param-counter) conditions))))))))
+                      (incf param-num)
+                      (push tag-value all-params)
+                      (push (format nil "$~A = ANY(tagvalues)" param-num) conditions))))))))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
-    ;; Add limit as a parameter
-    (incf param-counter)
-    (push max-limit params)
-    (values filter-conditions (reverse params) param-counter)))
+    ;; Add limit
+    (incf param-num)
+    (push max-limit all-params)
+    (values filter-conditions (reverse all-params) param-num))))
 
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
