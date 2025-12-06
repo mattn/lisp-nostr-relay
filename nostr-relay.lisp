@@ -21,7 +21,7 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :bordeaux-threads) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :bordeaux-threads :split-sequence) :silent t)
 
 ;; Try to load secp256k1 if available
 (handler-case
@@ -555,6 +555,33 @@
       (format t "Error handling REQ: ~A~%" e)
       (send ws (encode-json-string (vector "EOSE" subscription-id))))))
 
+(defun handle-deletion-event (event)
+  "Handle kind 5 deletion events (NIP-09)"
+  (let ((pubkey (event-field "pubkey" event))
+        (tags (event-field "tags" event)))
+    (when (listp tags)
+      (dolist (tag tags)
+        (when (and (listp tag) (>= (length tag) 2))
+          (let ((tag-name (first tag))
+                (tag-value (second tag)))
+            (cond
+              ;; Delete specific event by ID
+              ((equal tag-name "e")
+               (format t "Deleting event ~A by ~A~%" tag-value pubkey)
+               (db-execute "DELETE FROM event WHERE id = $1 AND pubkey = $2"
+                        tag-value pubkey))
+              ;; Delete events by coordinate (kind:pubkey:d-tag)
+              ((equal tag-name "a")
+               (let ((parts (split-sequence:split-sequence #\: tag-value)))
+                 (when (= (length parts) 3)
+                   (let ((kind (parse-integer (first parts) :junk-allowed t))
+                         (target-pubkey (second parts))
+                         (d-tag (third parts)))
+                     (when (and kind (string= target-pubkey pubkey))
+                       (format t "Deleting parameterized event ~A:~A:~A~%" kind pubkey d-tag)
+                       (db-execute "DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND $3 = ANY(tagvalues)"
+                                kind pubkey d-tag)))))))))))))
+
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
   (let ((tags (cdr (assoc "tags" event :test #'equal))))
@@ -578,6 +605,9 @@
     ;; Verify event
     (if (verify-event event)
         (progn
+          ;; Handle deletion events (kind 5)
+          (when (= (event-field "kind" event) 5)
+            (handle-deletion-event event))
           ;; Store event
           (store-event event)
           ;; Send OK response
@@ -789,5 +819,5 @@
     (format t "Starting server on 0.0.0.0:~A~%" port)
     (force-output)
     (clack:clackup *app* :server *handler* :address "0.0.0.0" :port port :use-thread t)
-    (loop (sleep 1)))
-)
+    (loop (sleep 1)
+)))
