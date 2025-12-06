@@ -323,6 +323,10 @@
       (= kind 3)
       (and (>= kind 10000) (<= kind 19999))))
 
+(defun is-deletion (kind)
+  "Check if event kind is deletion (kind 5)"
+  (= kind 5))
+
 (defun is-ephemeral (kind)
   "Check if event kind is ephemeral (kind 20000-29999)"
   (and (>= kind 20000) (<= kind 29999)))
@@ -354,6 +358,10 @@
     (when id
       (handler-case
           (cond
+            ;; Deletion events are not stored
+            ((is-deletion kind)
+             (format t "Deletionevent, not storing: ~A~%" id))
+
             ;; Ephemeral events are not stored
             ((is-ephemeral kind)
              (format t "Ephemeral event, not storing: ~A~%" id))
