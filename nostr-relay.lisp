@@ -415,7 +415,6 @@
   "Build SQL query from filters with parameterized queries"
   (let ((filter-conditions nil)
         (all-params nil)
-        (param-num 0)
         (max-limit 100))
     (dolist (filter filters)
       (let ((kinds (event-field "kinds" filter))
@@ -423,7 +422,8 @@
             (since (event-field "since" filter))
             (until (event-field "until" filter))
             (limit (event-field "limit" filter))
-            (conditions nil))
+            (conditions nil)
+            (filter-params nil))
         (when limit
           (when (and (integerp limit) (> limit 0))
             (setf max-limit (min max-limit limit))))
@@ -431,34 +431,28 @@
           (if (listp kinds)
               (let ((placeholders nil))
                 (dolist (kind kinds)
-                  (incf param-num)
-                  (push kind all-params)
-                  (push (format nil "$~A" param-num) placeholders))
+                  (push kind filter-params)
+                  (push (format nil "$~A" (+ (length all-params) (length filter-params))) placeholders))
                 (push (format nil "kind IN (~{~A~^,~})" (reverse placeholders)) conditions))
               (progn
-                (incf param-num)
-                (push kinds all-params)
-                (push (format nil "kind = $~A" param-num) conditions))))
+                (push kinds filter-params)
+                (push (format nil "kind = $~A" (+ (length all-params) (length filter-params))) conditions))))
         (when authors
           (if (listp authors)
               (let ((placeholders nil))
                 (dolist (author authors)
-                  (incf param-num)
-                  (push author all-params)
-                  (push (format nil "$~A" param-num) placeholders))
+                  (push author filter-params)
+                  (push (format nil "$~A" (+ (length all-params) (length filter-params))) placeholders))
                 (push (format nil "pubkey IN (~{~A~^,~})" (reverse placeholders)) conditions))
               (progn
-                (incf param-num)
-                (push authors all-params)
-                (push (format nil "pubkey = $~A" param-num) conditions))))
+                (push authors filter-params)
+                (push (format nil "pubkey = $~A" (+ (length all-params) (length filter-params))) conditions))))
         (when since
-          (incf param-num)
-          (push since all-params)
-          (push (format nil "created_at >= $~A" param-num) conditions))
+          (push since filter-params)
+          (push (format nil "created_at >= $~A" (+ (length all-params) (length filter-params))) conditions))
         (when until
-          (incf param-num)
-          (push until all-params)
-          (push (format nil "created_at <= $~A" param-num) conditions))
+          (push until filter-params)
+          (push (format nil "created_at <= $~A" (+ (length all-params) (length filter-params))) conditions))
         ;; Handle tag filters
         (dolist (pair filter)
           (when (consp pair)
@@ -468,15 +462,14 @@
                 (when (and (> (length key) 1) (char= (char key 0) #\#))
                   (when (and value (listp value))
                     (dolist (tag-value value)
-                      (incf param-num)
-                      (push tag-value all-params)
-                      (push (format nil "$~A = ANY(tagvalues)" param-num) conditions))))))))
+                      (push tag-value filter-params)
+                      (push (format nil "$~A = ANY(tagvalues)" (+ (length all-params) (length filter-params))) conditions))))))))
         (when conditions
-          (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
+          (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions)
+          (setf all-params (append all-params (reverse filter-params))))))
     ;; Add limit
-    (incf param-num)
     (push max-limit all-params)
-    (values filter-conditions (reverse all-params) param-num)))
+    (values filter-conditions all-params (length all-params))))
 
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
@@ -491,9 +484,10 @@
                  (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT $~A" where-clause limit-param-num)))
             (format t "SQL: ~A~%" sql)
             (format t "Params: ~A~%" params)
+            (format t "Param count: ~A, Expected: ~A~%" (length params) limit-param-num)
             (let ((results (bordeaux-threads:with-lock-held (*db-query-lock*)
                              (with-db-retry
-                               (query sql params)))))
+                               (eval `(query ,sql ,@params))))))
               (format t "Results count: ~A~%" (length results))
               ;; Send matched events
               (dolist (row results)
