@@ -360,7 +360,7 @@
           (cond
             ;; Deletion events are not stored
             ((is-deletion kind)
-             (format t "Deletionevent, not storing: ~A~%" id))
+             (format t "Deletion event, not storing: ~A~%" id))
 
             ;; Ephemeral events are not stored
             ((is-ephemeral kind)
@@ -573,11 +573,35 @@
           (let ((tag-name (first tag))
                 (tag-value (second tag)))
             (cond
-              ;; Delete specific event by ID
               ((equal tag-name "e")
-               (format t "Deleting event ~A by ~A~%" tag-value pubkey)
-               (db-execute "DELETE FROM event WHERE id = $1 AND pubkey = $2"
-                        tag-value pubkey))
+               (handler-case
+                   (let ((target-event (db-query "SELECT kind, pubkey, tags::text FROM event WHERE id = $1" (list tag-value))))
+                     (when target-event
+                       (destructuring-bind (kind target-pubkey tags-str) (first target-event)
+                         (let ((parsed-tags (when tags-str
+                                              (handler-case
+                                                  (yason:parse tags-str :object-as :alist)
+                                                (error () nil)))))
+                           (cond
+                             ;; Standard deletion if pubkey matches
+                             ((string= target-pubkey pubkey)
+                              (format t "Deleting event ~A by ~A (standard)~%" tag-value pubkey)
+                              (db-execute "DELETE FROM event WHERE id = $1 AND pubkey = $2" tag-value pubkey))
+                             ;; NIP-59: Delete kind 1059 if pubkey matches any p-tag
+                             ((and (= kind 1059)
+                                   parsed-tags
+                                   (some (lambda (ptag) (and (listp ptag)
+                                                             (>= (length ptag) 2)
+                                                             (equal (first ptag) "p")
+                                                             (equal (second ptag) pubkey)))
+                                         parsed-tags))
+                              (format t "Deleting gift wrap event ~A by ~A (NIP-59)~%" tag-value pubkey)
+                              (db-execute "DELETE FROM event WHERE id = $1" tag-value))
+                             (t
+                              (format t "Cannot delete event ~A: no permission~%" tag-value)))))))
+                 (error (e)
+                   (format t "Error processing deletion for ~A: ~A~%" tag-value e)
+                   nil)))
               ;; Delete events by coordinate (kind:pubkey:d-tag)
               ((equal tag-name "a")
                (let ((parts (split-sequence:split-sequence #\: tag-value)))
@@ -588,7 +612,8 @@
                      (when (and kind (string= target-pubkey pubkey))
                        (format t "Deleting parameterized event ~A:~A:~A~%" kind pubkey d-tag)
                        (db-execute "DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND $3 = ANY(tagvalues)"
-                                kind pubkey d-tag)))))))))))))
+                                kind pubkey d-tag))))))
+              )))))))
 
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
