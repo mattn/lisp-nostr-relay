@@ -41,6 +41,10 @@
 (in-package :nostr-relay)
 
 (defparameter *handler* :hunchentoot)
+(defparameter *hunchentoot-settings* 
+  '(:thread-pool-size 200
+    :max-thread-count 200
+    :max-accept-count 100))
 
 ;; URL decode
 (defun url-decode (string)
@@ -486,6 +490,10 @@
     (push max-limit all-params)
     (values filter-conditions (reverse all-params) param-counter)))
 
+(defun unregister-client (client)
+  (bordeaux-threads:with-lock-held (*clients-lock*)
+    (setf *clients* (remove client *clients*))))
+
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
   (handler-case
@@ -739,18 +747,46 @@
                       (on :close ws
                           (lambda (&key code reason)
                             (declare (ignore code reason))
-                            (bordeaux-threads:with-lock-held (*clients-lock*)
-                              (setf *clients* (remove ws *clients*))
-                              (decf *connection-count*))
-                            ;; Remove subscriptions for this client
-                            (maphash (lambda (sub-id sub-list)
-                                       (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
-                                         (if updated-list
-                                             (setf (gethash sub-id *subscriptions*) updated-list)
-                                             (remhash sub-id *subscriptions*))))
-                                     *subscriptions*)
-                            ;; Force garbage collection
-                            (sb-ext:gc :full t)))
+                            (handler-case
+                                (progn
+                                  (format t "Closing WebSocket connection...~%")
+                                  ;; Remove subscriptions for this client first
+                                  (maphash (lambda (sub-id sub-list)
+                                             (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
+                                               (if updated-list
+                                                   (setf (gethash sub-id *subscriptions*) updated-list)
+                                                   (remhash sub-id *subscriptions*))))
+                                           *subscriptions*)
+                                  ;; Remove client
+                                  (bordeaux-threads:with-lock-held (*clients-lock*)
+                                    (setf *clients* (remove ws *clients* :test #'eq))
+                                    (decf *connection-count*))
+                                  (format t "Client disconnected, remaining: ~A~%" *connection-count*)
+                                  (force-output))
+                              (error (e)
+                                (format t "Error in close handler: ~A~%" e)
+                                (force-output)))))
+                      (on :error ws
+                          (lambda (error)
+                            (format t "WebSocket error: ~A~%" error)
+                            (handler-case
+                                (progn
+                                  ;; Clean up on error
+                                  (maphash (lambda (sub-id sub-list)
+                                             (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
+                                               (if updated-list
+                                                   (setf (gethash sub-id *subscriptions*) updated-list)
+                                                   (remhash sub-id *subscriptions*))))
+                                           *subscriptions*)
+                                  (bordeaux-threads:with-lock-held (*clients-lock*)
+                                    (setf *clients* (remove ws *clients* :test #'eq))
+                                    (when (> *connection-count* 0)
+                                      (decf *connection-count*)))
+                                  (format t "Client removed due to error, remaining: ~A~%" *connection-count*)
+                                  (force-output))
+                              (error (e)
+                                (format t "Error in error handler: ~A~%" e)
+                                (force-output)))))
                       (lambda (responder)
                         (declare (ignore responder))
                         (start-connection ws)))))
@@ -865,6 +901,12 @@
     (format t "Static files path: ~A~%" *public-path*)
     (format t "Starting server on 0.0.0.0:~A~%" port)
     (force-output)
-    (clack:clackup *app* :server *handler* :address "0.0.0.0" :port port :use-thread t)
+    (clack:clackup *app* 
+                   :server *handler* 
+                   :address "0.0.0.0" 
+                   :port port 
+                   :use-thread nil
+                   :debug nil
+                   :server-options *hunchentoot-settings*)
     (loop (sleep 1)
 )))
