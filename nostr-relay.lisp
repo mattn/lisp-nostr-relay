@@ -225,8 +225,9 @@
 ;; Helper function to encode JSON with yason (supports raw UTF-8)
 (defun encode-json-string (obj)
   "Encode object to JSON string using yason (supports raw UTF-8)"
-  (with-output-to-string (s)
-    (yason:encode obj s)))
+  (let ((yason:*symbol-encoder* #'yason:encode-symbol-as-lowercase-string))
+    (with-output-to-string (s)
+      (yason:encode obj s))))
 
 ;; SHA-256 hash calculation
 (defun sha256-hex (string)
