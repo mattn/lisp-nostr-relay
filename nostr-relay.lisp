@@ -206,6 +206,8 @@
 (defvar *subscriptions* (make-hash-table :test 'equal))
 (defvar *clients* nil)
 (defvar *clients-lock* (bordeaux-threads:make-lock "clients"))
+(defvar *max-connections* 100)
+(defvar *connection-count* 0)
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -719,33 +721,39 @@
           (force-output)
           (if (and upgrade (string-equal upgrade "websocket"))
               ;; WebSocket connection
-              (let ((ws (make-server env)))
-                (bordeaux-threads:with-lock-held (*clients-lock*)
-                  (push ws *clients*))
-                (on :message ws
-                    (lambda (message)
-                      (handler-case
-                          (handle-nostr-message ws message)
-                        (error (e)
-                          (format t "ERROR in WebSocket message handler: ~A~%" e)
-                          (force-output)))))
-                (on :close ws
-                    (lambda (&key code reason)
-                      (declare (ignore code reason))
-                      (bordeaux-threads:with-lock-held (*clients-lock*)
-                        (setf *clients* (remove ws *clients*)))
-                      ;; Remove subscriptions for this client
-                      (maphash (lambda (sub-id sub-list)
-                                 (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
-                                   (if updated-list
-                                       (setf (gethash sub-id *subscriptions*) updated-list)
-                                       (remhash sub-id *subscriptions*))))
-                               *subscriptions*)
-                      ;; Force garbage collection
-                      (sb-ext:gc :full t)))
-                (lambda (responder)
-                  (declare (ignore responder))
-                  (start-connection ws)))
+              (bordeaux-threads:with-lock-held (*clients-lock*)
+                (if (>= *connection-count* *max-connections*)
+                    ;; Too many connections
+                    '(503 (:content-type "text/plain") ("Service Unavailable: Too many connections"))
+                    ;; Accept connection
+                    (let ((ws (make-server env)))
+                      (incf *connection-count*)
+                      (push ws *clients*)
+                      (on :message ws
+                          (lambda (message)
+                            (handler-case
+                                (handle-nostr-message ws message)
+                              (error (e)
+                                (format t "ERROR in WebSocket message handler: ~A~%" e)
+                                (force-output)))))
+                      (on :close ws
+                          (lambda (&key code reason)
+                            (declare (ignore code reason))
+                            (bordeaux-threads:with-lock-held (*clients-lock*)
+                              (setf *clients* (remove ws *clients*))
+                              (decf *connection-count*))
+                            ;; Remove subscriptions for this client
+                            (maphash (lambda (sub-id sub-list)
+                                       (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
+                                         (if updated-list
+                                             (setf (gethash sub-id *subscriptions*) updated-list)
+                                             (remhash sub-id *subscriptions*))))
+                                     *subscriptions*)
+                            ;; Force garbage collection
+                            (sb-ext:gc :full t)))
+                      (lambda (responder)
+                        (declare (ignore responder))
+                        (start-connection ws)))))
               ;; Normal HTTP request
               (cond
                 ;; NIP-11 relay information
@@ -822,7 +830,8 @@
         (progn
           ;; Clean up dead WebSocket connections
           (bordeaux-threads:with-lock-held (*clients-lock*)
-            (setf *clients* (remove-if-not #'websocket-driver:ready-state *clients*)))
+            (setf *clients* (remove-if-not #'websocket-driver:ready-state *clients*))
+            (setf *connection-count* (length *clients*)))
           ;; Clean up orphaned subscriptions
           (let ((active-ws (bordeaux-threads:with-lock-held (*clients-lock*)
                              (copy-list *clients*))))
@@ -837,7 +846,7 @@
                      *subscriptions*))
           ;; Force garbage collection
           (sb-ext:gc :full t)
-          (format t "Cleanup completed at ~A~%" (get-universal-time)))
+          (format t "Cleanup completed at ~A, connections: ~A~%" (get-universal-time) *connection-count*))
       (error (e)
         (format t "Error in cleanup thread: ~A~%" e)))))
 
