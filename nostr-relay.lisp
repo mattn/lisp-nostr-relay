@@ -140,8 +140,25 @@
     nil))
 
 ;; Execute query with automatic reconnection
+;;(defmacro with-db-retry (&body body)
+;;
+;;  "Execute body with automatic reconnection on database error"
+;;  (let ((retry-sym (gensym "RETRY"))
+;;        (e-sym (gensym "E")))
+;;    `(block with-db-retry
+;;       (dotimes (,retry-sym 2)
+;;         (handler-case
+;;             (return-from with-db-retry
+;;               (progn ,@body))
+;;           (error (,e-sym)
+;;             (format t "Database error: ~A~%" ,e-sym)
+;;             (when (= ,retry-sym 0)
+;;               (if (ensure-db-connection)
+;;                   (format t "Reconnected, retrying query...~%")
+;;                   (error "Database reconnection failed"))))))
+;;       (error "Query failed after reconnection attempt"))))
 (defmacro with-db-retry (&body body)
-  "Execute body with automatic reconnection on database error"
+  "Execute body with automatic reconnection on database error, attempt rollback on error."
   (let ((retry-sym (gensym "RETRY"))
         (e-sym (gensym "E")))
     `(block with-db-retry
@@ -151,16 +168,23 @@
                (progn ,@body))
            (error (,e-sym)
              (format t "Database error: ~A~%" ,e-sym)
+             (ignore-errors (when (fboundp 'rollback) (rollback)))
              (when (= ,retry-sym 0)
                (if (ensure-db-connection)
                    (format t "Reconnected, retrying query...~%")
                    (error "Database reconnection failed"))))))
        (error "Query failed after reconnection attempt"))))
 
+
+;;(defmacro db-execute (query &rest params)
+;;  "Execute query with automatic reconnection"
+;;  `(with-db-retry
+;;     (execute ,query ,@params)))
 (defmacro db-execute (query &rest params)
-  "Execute query with automatic reconnection"
-  `(with-db-retry
-     (execute ,query ,@params)))
+  "Execute query with automatic reconnection and query lock to avoid concurrent execute/query issues."
+  `(bordeaux-threads:with-lock-held (*db-query-lock*)
+     (with-db-retry
+       (execute ,query ,@params))))
 
 ;; Query with automatic reconnection
 (defmacro db-query (sql-query &rest params)
