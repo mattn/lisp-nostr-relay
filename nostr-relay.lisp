@@ -581,8 +581,10 @@
                                        (dolist (pair event-alist)
                                          (setf (gethash (car pair) ht) (cdr pair)))
                                        ht)))
-                    (format t "Sending event: ~A~%" id)
-                    (send ws (encode-json-string (vector "EVENT" subscription-id event-hash)))))))))
+                    ;; Check if event is expired (NIP-40)
+                    (unless (is-expired event-alist)
+                      (format t "Sending event: ~A~%" id)
+                      (send ws (encode-json-string (vector "EVENT" subscription-id event-hash))))))))))
         ;; Send EOSE
         (format t "Sending EOSE for ~A~%" subscription-id)
         (send ws (encode-json-string (vector "EOSE" subscription-id)))
@@ -654,6 +656,33 @@
                   (format t "ERROR in tag processing: ~A~%" e))))))))))
 
 
+(defun get-expiration-timestamp (event)
+  "Extract expiration timestamp from event tags (NIP-40)"
+  (let ((tags (event-field "tags" event)))
+    (when tags
+      (let ((tag-list (if (vectorp tags) (coerce tags 'list) tags)))
+        (dolist (tag tag-list)
+          (let* ((tag-item (if (vectorp tag) (coerce tag 'list) tag)))
+            (when (and (listp tag-item) (>= (length tag-item) 2))
+              (let* ((tag-name-raw (first tag-item))
+                     (tag-name (if (stringp tag-name-raw)
+                                   tag-name-raw
+                                   (string-downcase (string tag-name-raw))))
+                     (tag-value-raw (second tag-item)))
+                (when (string= tag-name "expiration")
+                  (let ((timestamp (if (integerp tag-value-raw)
+                                       tag-value-raw
+                                       (parse-integer (princ-to-string tag-value-raw) :junk-allowed t))))
+                    (return-from get-expiration-timestamp timestamp)))))))))))
+
+(defun is-expired (event)
+  "Check if event is expired according to NIP-40"
+  (let ((expiration (get-expiration-timestamp event)))
+    (when expiration
+      (let ((current-time (get-universal-time)))
+        ;; Unix timestamp to Universal time conversion: add 2208988800
+        (< expiration (- current-time 2208988800))))))
+
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
   (let ((tags (cdr (assoc "tags" event :test #'equal))))
@@ -668,6 +697,12 @@
   "Handle EVENT message"
   (let ((event event-data))
     (format t "Storing event: ~A~%" event)
+    ;; Check for expired event (NIP-40)
+    (when (is-expired event)
+      (let ((event-id (event-field "id" event)))
+        (format t "Rejecting expired event (NIP-40): ~A~%" event-id)
+        (send ws (encode-json-string (vector "OK" event-id :false "invalid: event has expired (NIP-40)")))
+        (return-from handle-event)))
     ;; Check for protected event (NIP-70)
     (when (has-protected-tag event)
       (let ((event-id (event-field "id" event)))
