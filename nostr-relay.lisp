@@ -816,10 +816,11 @@
                                                    (setf (gethash sub-id *subscriptions*) updated-list)
                                                    (remhash sub-id *subscriptions*))))
                                            *subscriptions*)
-                                  ;; Remove client
-                                  (bordeaux-threads:with-lock-held (*clients-lock*)
-                                    (setf *clients* (remove ws *clients* :test #'eq))
-                                    (decf *connection-count*))
+                                   ;; Remove client
+                                   (bordeaux-threads:with-lock-held (*clients-lock*)
+                                     (setf *clients* (remove ws *clients* :test #'eq))
+                                     (when (> *connection-count* 0)
+                                       (decf *connection-count*)))
                                   (format t "Client disconnected, remaining: ~A~%" *connection-count*)
                                   (force-output))
                               (error (e)
