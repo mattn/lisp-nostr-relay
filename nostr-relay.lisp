@@ -41,7 +41,7 @@
 (in-package :nostr-relay)
 
 (defparameter *handler* :hunchentoot)
-(defparameter *hunchentoot-settings* 
+(defparameter *hunchentoot-settings*
   '(:thread-pool-size 200
     :max-thread-count 200
     :max-accept-count 100))
@@ -272,7 +272,7 @@
          (tags-raw (event-field "tags" event))
          (tags (if (null tags-raw) (vector) tags-raw))
          (content (event-field "content" event))
-         (serialized (encode-json-string 
+         (serialized (encode-json-string
                       (list 0 pubkey created-at kind tags content))))
     (sha256-hex serialized)))
 
@@ -367,7 +367,7 @@
   "Extract 'd' tag value from tags array"
   (when (listp tags)
     (dolist (tag tags)
-      (when (and (listp tag) 
+      (when (and (listp tag)
                  (>= (length tag) 2)
                  (equal (first tag) "d"))
         (return-from get-d-tag (second tag)))))
@@ -393,40 +393,40 @@
             ;; Ephemeral events are not stored
             ((is-ephemeral kind)
              (format t "Ephemeral event, not storing: ~A~%" id))
-            
+
             ;; Replaceable events: replace if newer
             ((is-replaceable kind)
              (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
-                      id pubkey created-at kind 
+                      id pubkey created-at kind
                       (encode-json-to-string tags)
                       content sig)
              ;; Delete older events with same pubkey and kind
              (db-execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
                       pubkey kind created-at))
-            
+
             ;; Parameterized replaceable events: replace if newer with same d tag
             ((is-parameterized-replaceable kind)
              (let ((d-tag (get-d-tag tags)))
                (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                          ON CONFLICT (id) DO NOTHING"
-                        id pubkey created-at kind 
+                        id pubkey created-at kind
                         (encode-json-string tags)
                         content sig)
                ;; Delete older events with same pubkey, kind, and d tag
-               (db-execute "DELETE FROM event 
+               (db-execute "DELETE FROM event
                          WHERE pubkey = $1 AND kind = $2 AND created_at < $3
                          AND $4 = ANY(tagvalues)"
                         pubkey kind created-at d-tag)))
-            
+
             ;; Regular events
             (t
              (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
-                      id pubkey created-at kind 
+                      id pubkey created-at kind
                       (encode-json-string tags)
                       content sig)))
         (error (e)
@@ -547,22 +547,22 @@
                                                     (tag-str (babel:octets-to-string tag-bytes :encoding :utf-8))
                                                     (alist-tags (yason:parse tag-str :object-as :alist)))
                                                ;; Convert alist to vector of vectors with all strings
-                                               (map 'vector 
-                                                    (lambda (tag) 
-                                                      (map 'vector 
+                                               (map 'vector
+                                                    (lambda (tag)
+                                                      (map 'vector
                                                            (lambda (item)
                                                              (if (stringp item)
                                                                  item
                                                                  (format nil "~(~A~)" item)))
                                                            tag))
                                                     alist-tags))
-                                           (error (e) 
+                                           (error (e)
                                              (format t "Error parsing tags: ~A~%" e)
                                              (vector))))
-                                        ((listp tags) 
-                                         (map 'vector 
-                                              (lambda (tag) 
-                                                (map 'vector 
+                                        ((listp tags)
+                                         (map 'vector
+                                              (lambda (tag)
+                                                (map 'vector
                                                      (lambda (item)
                                                        (if (stringp item)
                                                            item
@@ -591,7 +591,7 @@
         ;; Save subscription (support multiple clients with same sub-id)
         (let ((existing (gethash subscription-id *subscriptions*)))
           (setf (gethash subscription-id *subscriptions*)
-                (cons (list :ws ws :filters filters) 
+                (cons (list :ws ws :filters filters)
                       (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing)))))
     (error (e)
       (format t "Error handling REQ: ~A~%" e)
@@ -608,12 +608,12 @@
             (when (and (listp tag-item) (>= (length tag-item) 2))
               (handler-case
                   (let* ((tag-name-raw (first tag-item))
-                         (tag-name (if (stringp tag-name-raw) 
-                                       tag-name-raw 
+                         (tag-name (if (stringp tag-name-raw)
+                                       tag-name-raw
                                        (string-downcase (string tag-name-raw))))
                          (tag-value-raw (second tag-item))
-                         (tag-value (if (stringp tag-value-raw) 
-                                        tag-value-raw 
+                         (tag-value (if (stringp tag-value-raw)
+                                        tag-value-raw
                                         (princ-to-string tag-value-raw))))
                     (cond
                       ((string= tag-name "e")
@@ -783,7 +783,7 @@
         (let ((upgrade (gethash "upgrade" (getf env :headers)))
               (accept (gethash "accept" (getf env :headers)))
               (path (getf env :path-info)))
-          (format t "~A Request path: ~A, Accept: ~A~%" 
+          (format t "~A Request path: ~A, Accept: ~A~%"
                   (get-universal-time) path accept)
           (force-output)
           (if (and upgrade (string-equal upgrade "websocket"))
@@ -854,7 +854,7 @@
                 ;; NIP-11 relay information
                 ((and accept (search "application/nostr+json" accept))
                  (let* ((relay-name (or (uiop:getenv "RELAY_NAME") "Lisp Nostr Relay"))
-                        (relay-description (or (uiop:getenv "RELAY_DESCRIPTION") 
+                        (relay-description (or (uiop:getenv "RELAY_DESCRIPTION")
                                                "A lightweight Nostr relay implementation in Common Lisp"))
                         (relay-pubkey (or (uiop:getenv "RELAY_PUBKEY") ""))
                         (relay-contact (or (uiop:getenv "RELAY_CONTACT") ""))
@@ -868,7 +868,7 @@
                      (setf (gethash "contact" info) relay-contact))
                    (when (not (string= relay-icon ""))
                      (setf (gethash "icon" info) relay-icon))
-                   (setf (gethash "supported_nips" info) 
+                   (setf (gethash "supported_nips" info)
                          (vector 1 2 4 9 11 12 15 16 20 22 28 33 40 50 62 70))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
@@ -885,7 +885,7 @@
                      (setf (gethash "auth_required" limitation) yason:false)
                      (setf (gethash "payment_required" limitation) yason:false)
                      (setf (gethash "limitation" info) limitation))
-                   (list 200 
+                   (list 200
                          (list :content-type "application/nostr+json"
                                :access-control-allow-origin "*"
                                :access-control-allow-headers "Content-Type"
@@ -911,7 +911,7 @@
                      (force-output)
                      '(400 () ("Bad Request"))))))))
       (error (e)
-        (format t "ERROR in app handler: ~A~%~A~%" e 
+        (format t "ERROR in app handler: ~A~%~A~%" e
                 (with-output-to-string (s)
                   (sb-debug:print-backtrace :stream s :count 20)))
         (force-output)
@@ -925,15 +925,17 @@
         (progn
           ;; Clean up dead WebSocket connections
           (bordeaux-threads:with-lock-held (*clients-lock*)
-            (setf *clients* (remove-if-not #'websocket-driver:ready-state *clients*))
+            (setf *clients* (remove-if (lambda (ws)
+                                         (not (eq (websocket-driver:ready-state ws) :open)))
+                                       *clients*))
             (setf *connection-count* (length *clients*)))
           ;; Clean up orphaned subscriptions
           (let ((active-ws (bordeaux-threads:with-lock-held (*clients-lock*)
                              (copy-list *clients*))))
             (maphash (lambda (sub-id sub-list)
-                       (let ((valid-subs (remove-if-not 
-                                           (lambda (sub) 
-                                             (member (getf sub :ws) active-ws))
+                       (let ((valid-subs (remove-if-not
+                                           (lambda (sub)
+                                             (member (getf sub :ws) active-ws :test #'eq))
                                            sub-list)))
                          (if valid-subs
                              (setf (gethash sub-id *subscriptions*) valid-subs)
@@ -949,8 +951,8 @@
   ;; Database initialization and server startup
   (initialize)
   (connect-db)
-  (setf *public-path* (merge-pathnames "public/" 
-                                       (or *load-pathname* 
+  (setf *public-path* (merge-pathnames "public/"
+                                       (or *load-pathname*
                                            *compile-file-pathname*
                                            (truename ".")
                                            #p"/app/")))
@@ -960,10 +962,10 @@
     (format t "Static files path: ~A~%" *public-path*)
     (format t "Starting server on 0.0.0.0:~A~%" port)
     (force-output)
-    (clack:clackup *app* 
-                   :server *handler* 
-                   :address "0.0.0.0" 
-                   :port port 
+    (clack:clackup *app*
+                   :server *handler*
+                   :address "0.0.0.0"
+                   :port port
                    :use-thread nil
                    :debug nil
                    :server-options *hunchentoot-settings*)
