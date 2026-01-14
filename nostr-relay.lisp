@@ -104,14 +104,16 @@
     (handler-case
         (progn
           (format t "Connecting to database...~%")
-          (connect-toplevel (getf *db-config* :database)
-                            (getf *db-config* :user)
-                            (getf *db-config* :password)
-                            (getf *db-config* :host)
-                            :port (getf *db-config* :port)
-                            :use-ssl :try)
-          (format t "Database connected successfully~%")
-          t)
+          (let ((conn (connect (getf *db-config* :database)
+                               (getf *db-config* :user)
+                               (getf *db-config* :password)
+                               (getf *db-config* :host)
+                               :port (getf *db-config* :port)
+                               :pooled-p nil
+                               :use-ssl :try)))
+            (postmodern:*database* conn)
+            (format t "Database connected successfully~%")
+            t))
       (error (e)
         (format t "Error connecting to database: ~A~%" e)
         nil))))
@@ -128,7 +130,13 @@
 (defun ensure-db-connection ()
   (unless (db-connected-p)
     (format t "Database connection lost, attempting to reconnect...~%")
-    (disconnect-toplevel)
+    (ignore-errors
+      (handler-case
+          (disconnect-toplevel)
+        (error (e)
+          (format t "Warning: Error during disconnect: ~A~%" e)
+          ;; Force cleanup even if disconnect fails
+          (ignore-errors (sb-ext:gc :full t)))))
     (dotimes (i *db-max-retries*)
       (format t "Reconnection attempt ~A/~A~%" (1+ i) *db-max-retries*)
       (when (connect-db)
@@ -209,12 +217,12 @@
                          (getf *db-config* :host)
                          :port (getf *db-config* :port)
                          :use-ssl :try)
-      (db-execute "CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
+    (db-execute "CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
                 AS 'SELECT array_agg(t->>1) FROM (SELECT jsonb_array_elements($1) AS t)s WHERE length(t->>0) = 1;'
                 LANGUAGE SQL
                 IMMUTABLE
                 RETURNS NULL ON NULL INPUT")
-      (db-execute "CREATE TABLE IF NOT EXISTS event (
+    (db-execute "CREATE TABLE IF NOT EXISTS event (
                 id text NOT NULL,
                 pubkey text NOT NULL,
                 created_at integer NOT NULL,
@@ -799,7 +807,10 @@
                       (on :message ws
                           (lambda (message)
                             (handler-case
-                                (handle-nostr-message ws message)
+                                (progn
+                                  (handle-nostr-message ws message)
+                                  ;; Explicitly allow GC of message
+                                  (setf message nil))
                               (error (e)
                                 (format t "ERROR in WebSocket message handler: ~A~%" e)
                                 (force-output)))))
@@ -921,7 +932,7 @@
 (defun cleanup-thread ()
   "Periodic cleanup thread to prevent memory leaks"
   (loop
-    (sleep 300) ; 5 minutes
+    (sleep 60) ; 1 minute - more frequent cleanup
     (handler-case
         (progn
           ;; Clean up dead WebSocket connections
@@ -944,7 +955,8 @@
                      *subscriptions*))
           ;; Force garbage collection
           (sb-ext:gc :full t)
-          (format t "Cleanup completed at ~A, connections: ~A~%" (get-universal-time) *connection-count*))
+          (format t "Cleanup: connections=~A subs=~A~%" *connection-count* (hash-table-count *subscriptions*))
+          (force-output))
       (error (e)
         (format t "Error in cleanup thread: ~A~%" e)))))
 
