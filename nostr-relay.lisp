@@ -111,7 +111,7 @@
                                :port (getf *db-config* :port)
                                :pooled-p nil
                                :use-ssl :try)))
-            (postmodern:*database* conn)
+            (setf (postmodern:*database*) conn)
             (format t "Database connected successfully~%")
             t))
       (error (e)
