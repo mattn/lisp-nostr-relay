@@ -21,13 +21,13 @@
         (load target)
         (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
-(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :bordeaux-threads :split-sequence) :silent t)
+(ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :bordeaux-threads :split-sequence :log4cl) :silent t)
 
 ;; Try to load secp256k1 if available
 (handler-case
     (ql:quickload :secp256k1 :silent t)
   (error (e)
-    (format t "[INFO] Warning: secp256k1 not available, signature verification disabled: ~A~%" e)))
+    (log:warn "secp256k1 not available, signature verification disabled: ~A" e)))
 
 (in-package :cl-user)
 (defpackage nostr-relay
@@ -39,6 +39,13 @@
                 :with-lock-held)
   (:export :main))
 (in-package :nostr-relay)
+
+;; Configure log4cl with date format
+(log4cl:add-appender log4cl:*root-logger*
+                     (make-instance 'log4cl:console-appender
+                                    :layout (make-instance 'log4cl:pattern-layout
+                                                           :conversion-pattern "%d{%Y-%m-%d %H:%M:%S} [%p] %m%n")))
+(log4cl:log-config :info)
 
 (defparameter *handler* :hunchentoot)
 (defparameter *hunchentoot-settings*
@@ -103,8 +110,7 @@
   (bordeaux-threads:with-lock-held (*db-connection-lock*)
     (handler-case
         (progn
-          (format t "[INFO] Connecting to database...~%")
-          (force-output)
+          (log:info "Connecting to database...")
           (let ((conn (connect (getf *db-config* :database)
                                (getf *db-config* :user)
                                (getf *db-config* :password)
@@ -113,10 +119,10 @@
                                :pooled-p nil
                                :use-ssl :try)))
             (setf postmodern:*database* conn)
-            (format t "[INFO] Database connected successfully~%")
+            (log:info "Database connected successfully")
             t))
       (error (e)
-        (format t "[INFO] Error connecting to database: ~A~%" e)
+        (log:error "Error connecting to database: ~A" e)
         nil))))
 
 ;; Check if database connection is alive
@@ -130,22 +136,22 @@
 ;; Reconnect to database with retry logic
 (defun ensure-db-connection ()
   (unless (db-connected-p)
-    (format t "[INFO] Database connection lost, attempting to reconnect...~%")
+    (log:info "Database connection lost, attempting to reconnect...")
     (ignore-errors
       (handler-case
           (disconnect-toplevel)
         (error (e)
-          (format t "[INFO] Warning: Error during disconnect: ~A~%" e)
+          (log:warn "Error during disconnect: ~A" e)
           ;; Force cleanup even if disconnect fails
           (ignore-errors (sb-ext:gc :full t)))))
     (dotimes (i *db-max-retries*)
-      (format t "[INFO] Reconnection attempt ~A/~A~%" (1+ i) *db-max-retries*)
+      (log:info "Reconnection attempt ~A/~A" (1+ i) *db-max-retries*)
       (when (connect-db)
         (return-from ensure-db-connection t))
       (unless (= i (1- *db-max-retries*))
-        (format t "[INFO] Waiting ~A seconds before retry...~%" *db-retry-delay*)
+        (log:info "Waiting ~A seconds before retry..." *db-retry-delay*)
         (sleep *db-retry-delay*)))
-    (format t "[INFO] Failed to reconnect after ~A attempts~%" *db-max-retries*)
+    (log:error "Failed to reconnect after ~A attempts" *db-max-retries*)
     nil))
 
 ;; Execute query with automatic reconnection
@@ -176,11 +182,11 @@
              (return-from with-db-retry
                (progn ,@body))
            (error (,e-sym)
-             (format t "[INFO] Database error: ~A~%" ,e-sym)
+             (log:error "Database error: ~A" ,e-sym)
              (ignore-errors (when (fboundp 'rollback) (rollback)))
              (when (= ,retry-sym 0)
                (if (ensure-db-connection)
-                   (format t "[INFO] Reconnected, retrying query...~%")
+                   (log:info "Reconnected, retrying query...")
                    (error "Database reconnection failed"))))))
        (error "Query failed after reconnection attempt"))))
 
@@ -322,13 +328,13 @@
           ;; Parse x-only pubkey
           (let ((parse-result (secp256k1::secp256k1-xonly-pubkey-parse ctx xonly-pubkey pubkey-ptr)))
             (unless (= parse-result 1)
-              (format t "[INFO] Failed to parse x-only pubkey~%")
+              (log:error "Failed to parse x-only pubkey")
               (return-from verify-schnorr-signature nil))
             ;; Verify schnorr signature
             (let ((verify-result (secp256k1::secp256k1-schnorrsig-verify ctx sig-ptr msg-ptr 32 xonly-pubkey)))
               (= verify-result 1)))))
     (error (e)
-      (format t "[INFO] Schnorr verification error: ~A~%" e)
+      (log:error "Schnorr verification error: ~A" e)
       nil)))
 
 ;; Event verification
@@ -339,19 +345,19 @@
             (pubkey (event-field "pubkey" event))
             (sig (event-field "sig" event))
             (computed-id (compute-event-id event)))
-        (format t "[INFO] Event ID: ~A~%" id)
-        (format t "[INFO] Computed ID: ~A~%" computed-id)
+        (log:info "Event ID: ~A" id)
+        (log:info "Computed ID: ~A" computed-id)
         ;; Verify ID
         (unless (string= id computed-id)
-          (format t "[INFO] Invalid event ID~%")
+          (log:error "Invalid event ID")
           (return-from verify-event nil))
         ;; Verify signature
         (unless (verify-schnorr-signature pubkey id sig)
-          (format t "[INFO] Invalid signature~%")
+          (log:error "Invalid signature")
           (return-from verify-event nil))
         t)
     (error (e)
-      (format t "[INFO] Event verification error: ~A~%" e)
+      (log:error "Event verification error: ~A" e)
       nil)))
 
 (defun is-replaceable (kind)
@@ -397,11 +403,11 @@
           (cond
             ;; Deletion events are not stored
             ((is-deletion kind)
-             (format t "[INFO] Deletion event, not storing: ~A~%" id))
+             (log:info "Deletion event, not storing: ~A" id))
 
             ;; Ephemeral events are not stored
             ((is-ephemeral kind)
-             (format t "[INFO] Ephemeral event, not storing: ~A~%" id))
+             (log:info "Ephemeral event, not storing: ~A" id))
 
             ;; Replaceable events: replace if newer
             ((is-replaceable kind)
@@ -439,7 +445,7 @@
                       (encode-json-string tags)
                       content sig)))
         (error (e)
-          (format t "[INFO] Error storing event: ~A~%" e))))))
+          (log:error "Error storing event: ~A" e))))))
 
 (defun match-filter (event filter)
   "Check if event matches filter"
@@ -538,13 +544,13 @@
                                    (format nil "WHERE ~{~A~^ OR ~}" conditions)
                                    ""))
                  (sql (format nil "SELECT id, pubkey, created_at, kind, tags::text, content, sig FROM event ~A ORDER BY created_at DESC LIMIT $~A" where-clause limit-param-num)))
-            (format t "[INFO] SQL: ~A~%" sql)
-            (format t "[INFO] Params: ~A~%" params)
-            (format t "[INFO] Param count: ~A, Expected: ~A~%" (length params) limit-param-num)
+            (log:debug "SQL: ~A" sql)
+            (log:debug "Params: ~A" params)
+            (log:debug "Param count: ~A, Expected: ~A" (length params) limit-param-num)
             (let ((results (bordeaux-threads:with-lock-held (*db-query-lock*)
                              (with-db-retry
                                (eval `(query ,sql ,@params))))))
-              (format t "[INFO] Results count: ~A~%" (length results))
+              (log:debug "Results count: ~A" (length results))
               ;; Send matched events
               (dolist (row results)
                 (destructuring-bind (id pubkey created-at kind tags content sig) row
@@ -566,7 +572,7 @@
                                                            tag))
                                                     alist-tags))
                                            (error (e)
-                                             (format t "[INFO] Error parsing tags: ~A~%" e)
+                                             (log:error "Error parsing tags: ~A" e)
                                              (vector))))
                                         ((listp tags)
                                          (map 'vector
@@ -592,10 +598,10 @@
                                        ht)))
                     ;; Check if event is expired (NIP-40)
                     (unless (is-expired event-alist)
-                      (format t "[INFO] Sending event: ~A~%" id)
+                      (log:debug "Sending event: ~A" id)
                       (send ws (encode-json-string (vector "EVENT" subscription-id event-hash))))))))))
         ;; Send EOSE
-        (format t "[INFO] Sending EOSE for ~A~%" subscription-id)
+        (log:debug "Sending EOSE for ~A" subscription-id)
         (send ws (encode-json-string (vector "EOSE" subscription-id)))
         ;; Save subscription (support multiple clients with same sub-id)
         (let ((existing (gethash subscription-id *subscriptions*)))
@@ -603,7 +609,7 @@
                 (cons (list :ws ws :filters filters)
                       (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing)))))
     (error (e)
-      (format t "[INFO] Error handling REQ: ~A~%" e)
+      (log:error "Error handling REQ: ~A" e)
       (send ws (encode-json-string (vector "EOSE" subscription-id))))))
 
 (defun handle-deletion-event (event)
@@ -636,7 +642,7 @@
                                                         (error () nil)))))
                                    (cond
                                      ((string= target-pubkey pubkey)
-                                      (format t "[INFO] Deleting event ~A by ~A (standard)~%" tag-value pubkey)
+                                      (log:info "Deleting event ~A by ~A (standard)" tag-value pubkey)
                                       (db-execute "DELETE FROM event WHERE id = $1 AND pubkey = $2" tag-value pubkey))
                                      ((and (= kind 1059)
                                            parsed-tags
@@ -645,12 +651,12 @@
                                                                      (equal (first ptag) "p")
                                                                      (equal (second ptag) pubkey)))
                                                  parsed-tags))
-                                      (format t "[INFO] Deleting gift wrap event ~A by ~A (NIP-59)~%" tag-value pubkey)
+                                      (log:info "Deleting gift wrap event ~A by ~A (NIP-59)" tag-value pubkey)
                                       (db-execute "DELETE FROM event WHERE id = $1" tag-value))
                                      (t
-                                      (format t "[INFO] Cannot delete event ~A: no permission~%" tag-value)))))))
+                                      (log:warn "Cannot delete event ~A: no permission" tag-value)))))))
                          (error (e)
-                           (format t "[INFO] Error processing deletion for ~A: ~A~%" tag-value e))))
+                           (log:error "Error processing deletion for ~A: ~A" tag-value e))))
                       ((string= tag-name "a")
                        (let ((parts (split-sequence:split-sequence #\: tag-value)))
                          (when (= (length parts) 3)
@@ -658,11 +664,11 @@
                                  (target-pubkey (second parts))
                                  (d-tag (third parts)))
                              (when (and kind (string= target-pubkey pubkey))
-                               (format t "[INFO] Deleting parameterized event ~A:~A:~A~%" kind pubkey d-tag)
+                               (log:info "Deleting parameterized event ~A:~A:~A" kind pubkey d-tag)
                                (db-execute "DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND $3 = ANY(tagvalues)"
                                            kind pubkey d-tag))))))))
                 (error (e)
-                  (format t "[INFO] ERROR in tag processing: ~A~%" e))))))))))
+                  (log:error "ERROR in tag processing: ~A" e))))))))))
 
 
 (defun get-expiration-timestamp (event)
@@ -705,17 +711,17 @@
 (defun handle-event (ws event-data)
   "Handle EVENT message"
   (let ((event event-data))
-    (format t "[INFO] Storing event: ~A~%" event)
+    (log:debug "Storing event: ~A" event)
     ;; Check for expired event (NIP-40)
     (when (is-expired event)
       (let ((event-id (event-field "id" event)))
-        (format t "[INFO] Rejecting expired event (NIP-40): ~A~%" event-id)
+        (log:info "Rejecting expired event (NIP-40): ~A" event-id)
         (send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired (NIP-40)")))
         (return-from handle-event)))
     ;; Check for protected event (NIP-70)
     (when (has-protected-tag event)
       (let ((event-id (event-field "id" event)))
-        (format t "[INFO] Rejecting protected event (NIP-70): ~A~%" event-id)
+        (log:info "Rejecting protected event (NIP-70): ~A" event-id)
         (send ws (encode-json-string (vector "OK" event-id yason:false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
@@ -728,7 +734,7 @@
           (store-event event)
           ;; Send OK response
           (let ((event-id (event-field "id" event)))
-            (format t "[INFO] Sending OK for event: ~A~%" event-id)
+            (log:debug "Sending OK for event: ~A" event-id)
             (send ws (encode-json-string (vector "OK" event-id t ""))))
           ;; Broadcast to subscribed clients
           (maphash (lambda (sub-id sub-list)
@@ -737,7 +743,7 @@
                              (filters (getf sub-info :filters)))
                          ;; Check if event matches any filter
                          (when (some (lambda (filter) (match-filter event filter)) filters)
-                           (format t "[INFO] Broadcasting event to subscription: ~A~%" sub-id)
+                           (log:debug "Broadcasting event to subscription: ~A" sub-id)
                            ;; Convert alist to hash table for encoding
                            (let ((event-hash (make-hash-table :test 'equal)))
                              (dolist (pair event)
@@ -746,7 +752,7 @@
                    *subscriptions*))
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
-          (format t "[INFO] Event verification failed: ~A~%" event-id)
+          (log:warn "Event verification failed: ~A" event-id)
           (send ws (encode-json-string (vector "OK" event-id yason:false "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id ws)
@@ -761,28 +767,28 @@
   "Handle Nostr message"
   (handler-case
       (let ((msg (yason:parse message :object-as :alist)))
-        (format t "[INFO] Received message: ~A~%" message)
-        (format t "[INFO] Parsed as: ~A~%" msg)
+        (log:debug "Received message: ~A" message)
+        (log:debug "Parsed as: ~A" msg)
         (when (and (listp msg) (> (length msg) 0))
           (let ((type (first msg)))
-            (format t "[INFO] Message type: ~A~%" type)
+            (log:debug "Message type: ~A" type)
             (cond
               ((equal type "EVENT")
                (when (>= (length msg) 2)
-                 (format t "[INFO] Handling EVENT~%")
+                 (log:debug "Handling EVENT")
                  (handle-event ws (second msg))))
               ((equal type "REQ")
                (when (>= (length msg) 2)
                  (let ((sub-id (second msg))
                        (filters (cddr msg)))
-                   (format t "[INFO] Handling REQ: sub-id=~A~%" sub-id)
+                   (log:debug "Handling REQ: sub-id=~A" sub-id)
                    (handle-req ws sub-id filters))))
               ((equal type "CLOSE")
                (when (>= (length msg) 2)
-                 (format t "[INFO] Handling CLOSE~%")
+                 (log:debug "Handling CLOSE")
                  (handle-close (second msg) ws)))))))
     (error (e)
-      (format t "[INFO] Error processing message: ~A~%" e))))
+      (log:error "Error processing message: ~A" e))))
 
 (defvar *public-path* nil)
 
@@ -792,8 +798,7 @@
         (let ((upgrade (gethash "upgrade" (getf env :headers)))
               (accept (gethash "accept" (getf env :headers)))
               (path (getf env :path-info)))
-          (format t "[INFO] ~A Request path: ~A, Accept: ~A~%"
-                  (get-universal-time) path accept)
+          (log:info "Request path: ~A, Accept: ~A" path accept)
           (if (and upgrade (string-equal upgrade "websocket"))
               ;; WebSocket connection
               (bordeaux-threads:with-lock-held (*clients-lock*)
@@ -812,13 +817,13 @@
                                   ;; Explicitly allow GC of message
                                   (setf message nil))
                               (error (e)
-                                (format t "[INFO] ERROR in WebSocket message handler: ~A~%" e)))))
+                                (log:error "ERROR in WebSocket message handler: ~A" e)))))
                       (on :close ws
                           (lambda (&key code reason)
                             (declare (ignore code reason))
                             (handler-case
                                 (progn
-                                  (format t "[INFO] Closing WebSocket connection...~%")
+                                  (log:debug "Closing WebSocket connection...")
                                   ;; Remove subscriptions for this client first
                                   (maphash (lambda (sub-id sub-list)
                                              (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
@@ -831,12 +836,12 @@
                                      (setf *clients* (remove ws *clients* :test #'eq))
                                      (when (> *connection-count* 0)
                                        (decf *connection-count*)))
-                                  (format t "[INFO] Client disconnected, remaining: ~A~%" *connection-count*))
+                                  (log:debug "Client disconnected, remaining: ~A" *connection-count*))
                               (error (e)
-                                (format t "[INFO] Error in close handler: ~A~%" e)))))
+                                (log:error "Error in close handler: ~A" e)))))
                       (on :error ws
                           (lambda (error)
-                            (format t "[INFO] WebSocket error: ~A~%" error)
+                            (log:error "WebSocket error: ~A" error)
                             (handler-case
                                 (progn
                                   ;; Clean up on error
@@ -850,9 +855,9 @@
                                     (setf *clients* (remove ws *clients* :test #'eq))
                                     (when (> *connection-count* 0)
                                       (decf *connection-count*)))
-                                  (format t "[INFO] Client removed due to error, remaining: ~A~%" *connection-count*))
+                                  (log:debug "Client removed due to error, remaining: ~A" *connection-count*))
                               (error (e)
-                                (format t "[INFO] Error in error handler: ~A~%" e)))))
+                                (log:error "Error in error handler: ~A" e)))))
                       (lambda (responder)
                         (declare (ignore responder))
                         (start-connection ws)))))
@@ -914,10 +919,10 @@
                              (list 200 (list :content-type content-type) content))
                            '(404 () ("Not Found"))))
                    (error (e)
-                     (format t "[INFO] Error serving file for path ~A: ~A~%" path e)
+                     (log:error "Error serving file for path ~A: ~A" path e)
                      '(400 () ("Bad Request"))))))))
       (error (e)
-        (format t "[INFO] ERROR in app handler: ~A~%~A~%" e
+        (log:error "ERROR in app handler: ~A~%~A" e
                 (with-output-to-string (s)
                   (sb-debug:print-backtrace :stream s :count 20)))
         '(500 (:content-type "text/plain") ("Internal Server Error"))))))
@@ -948,12 +953,13 @@
                      *subscriptions*))
           ;; Force garbage collection
           (sb-ext:gc :full t)
-          (format t "[INFO] Cleanup: connections=~A subs=~A~%" *connection-count* (hash-table-count *subscriptions*)))
+          (log:info "Cleanup: connections=~A subs=~A" *connection-count* (hash-table-count *subscriptions*)))
       (error (e)
-        (format t "[INFO] Error in cleanup thread: ~A~%" e)))))
+        (log:error "Error in cleanup thread: ~A" e)))))
 
 (defun main ()
   ;; Database initialization and server startup
+  (log:info "Starting application")
   (initialize)
   (connect-db)
   (setf *public-path* (merge-pathnames "public/"
@@ -964,8 +970,8 @@
   ;; Start cleanup thread
   (bordeaux-threads:make-thread #'cleanup-thread :name "cleanup-thread")
   (let ((port (parse-integer (or (uiop:getenv "PORT") "5000"))))
-    (format t "[INFO] Static files path: ~A~%" *public-path*)
-    (format t "[INFO] Starting server on 0.0.0.0:~A~%" port)
+    (log:info "Static files path: ~A" *public-path*)
+    (log:info "Starting server on 0.0.0.0:~A" port)
     (clack:clackup *app*
                    :server *handler*
                    :address "0.0.0.0"
