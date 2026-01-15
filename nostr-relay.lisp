@@ -709,13 +709,13 @@
     (when (is-expired event)
       (let ((event-id (event-field "id" event)))
         (format t "Rejecting expired event (NIP-40): ~A~%" event-id)
-        (send ws (encode-json-string (vector "OK" event-id :false "invalid: event has expired (NIP-40)")))
+        (send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired (NIP-40)")))
         (return-from handle-event)))
     ;; Check for protected event (NIP-70)
     (when (has-protected-tag event)
       (let ((event-id (event-field "id" event)))
         (format t "Rejecting protected event (NIP-70): ~A~%" event-id)
-        (send ws (encode-json-string (vector "OK" event-id :false "blocked: event contains '-' tag (NIP-70)")))
+        (send ws (encode-json-string (vector "OK" event-id yason:false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
@@ -746,7 +746,7 @@
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (format t "Event verification failed: ~A~%" event-id)
-          (send ws (encode-json-string (vector "OK" event-id :false "invalid: signature verification failed")))))))
+          (send ws (encode-json-string (vector "OK" event-id yason:false "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id ws)
   "Handle CLOSE message"
