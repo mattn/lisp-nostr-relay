@@ -41,6 +41,7 @@
 (in-package :nostr-relay)
 
 ;; Configure log4cl with date format
+(log4cl:remove-all-appenders log4cl:*root-logger*)
 (log4cl:add-appender log4cl:*root-logger*
                      (make-instance 'log4cl:console-appender
                                     :layout (make-instance 'log4cl:pattern-layout
