@@ -450,17 +450,67 @@
 
 (defun match-filter (event filter)
   "Check if event matches filter"
-  (let ((event-kind (event-field "kind" event))
+  (let ((event-id (event-field "id" event))
+        (event-kind (event-field "kind" event))
         (event-pubkey (event-field "pubkey" event))
+        (event-created-at (event-field "created_at" event))
+        (event-tags (event-field "tags" event))
+        (filter-ids (event-field "ids" filter))
         (filter-kinds (event-field "kinds" filter))
-        (filter-authors (event-field "authors" filter)))
+        (filter-authors (event-field "authors" filter))
+        (filter-since (event-field "since" filter))
+        (filter-until (event-field "until" filter)))
+    ;; Check ids filter
+    (when (and filter-ids
+               (not (some (lambda (fid)
+                            (and (stringp fid) (stringp event-id)
+                                 (eql 0 (search fid event-id))))
+                          (if (listp filter-ids) filter-ids (list filter-ids)))))
+      (return-from match-filter nil))
     ;; Check kinds filter
-    (when (and filter-kinds (not (member event-kind filter-kinds :test #'equal)))
+    (when (and filter-kinds (not (member event-kind
+                                         (if (listp filter-kinds) filter-kinds (list filter-kinds))
+                                         :test #'equal)))
       (return-from match-filter nil))
-    ;; Check authors filter
-    (when (and filter-authors (not (member event-pubkey filter-authors :test #'string=)))
+    ;; Check authors filter (prefix match)
+    (when (and filter-authors
+               (not (some (lambda (author)
+                            (and (stringp author) (stringp event-pubkey)
+                                 (eql 0 (search author event-pubkey))))
+                          (if (listp filter-authors) filter-authors (list filter-authors)))))
       (return-from match-filter nil))
-    ;; If we get here, all checks passed
+    ;; Check since filter
+    (when (and filter-since event-created-at
+               (< event-created-at filter-since))
+      (return-from match-filter nil))
+    ;; Check until filter
+    (when (and filter-until event-created-at
+               (> event-created-at filter-until))
+      (return-from match-filter nil))
+    ;; Check tag filters (#e, #p, etc.)
+    (let ((tag-list (when event-tags
+                      (if (vectorp event-tags) (coerce event-tags 'list) event-tags))))
+      (dolist (pair filter)
+        (when (consp pair)
+          (let ((key (car pair))
+                (values (cdr pair)))
+            (when (and (stringp key) (> (length key) 1) (char= (char key 0) #\#))
+              (let ((tag-name (subseq key 1)))
+                (unless (and values (listp values)
+                             (some (lambda (fval)
+                                     (some (lambda (tag)
+                                             (let ((tag-item (if (vectorp tag) (coerce tag 'list) tag)))
+                                               (and (listp tag-item)
+                                                    (>= (length tag-item) 2)
+                                                    (let ((tn (first tag-item)))
+                                                      (equal (if (stringp tn) tn (string-downcase (string tn)))
+                                                             tag-name))
+                                                    (equal (let ((tv (second tag-item)))
+                                                             (if (stringp tv) tv (princ-to-string tv)))
+                                                           fval))))
+                                           tag-list))
+                                   values))
+                  (return-from match-filter nil))))))))
     t))
 
 (defun build-query (filters)
