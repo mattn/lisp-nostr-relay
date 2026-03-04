@@ -249,6 +249,7 @@
       (db-execute "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues)")))
 
 (defvar *subscriptions* (make-hash-table :test 'equal))
+(defvar *subscriptions-lock* (bordeaux-threads:make-lock "subscriptions"))
 (defvar *clients* nil)
 (defvar *clients-lock* (bordeaux-threads:make-lock "clients"))
 (defvar *max-connections* 100)
@@ -656,10 +657,11 @@
         (log:debug "Sending EOSE for ~A" subscription-id)
         (send ws (encode-json-string (vector "EOSE" subscription-id)))
         ;; Save subscription (support multiple clients with same sub-id)
-        (let ((existing (gethash subscription-id *subscriptions*)))
-          (setf (gethash subscription-id *subscriptions*)
-                (cons (list :ws ws :filters filters)
-                      (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing)))))
+        (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+          (let ((existing (gethash subscription-id *subscriptions*)))
+            (setf (gethash subscription-id *subscriptions*)
+                  (cons (list :ws ws :filters filters)
+                        (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing))))))
     (error (e)
       (log:error "Error handling REQ: ~A" e)
       (send ws (encode-json-string (vector "EOSE" subscription-id))))))
@@ -809,11 +811,12 @@
 
 (defun handle-close (subscription-id ws)
   "Handle CLOSE message"
-  (let ((existing (gethash subscription-id *subscriptions*)))
-    (setf (gethash subscription-id *subscriptions*)
-          (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing))
-    (when (null (gethash subscription-id *subscriptions*))
-      (remhash subscription-id *subscriptions*))))
+  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+    (let ((existing (gethash subscription-id *subscriptions*)))
+      (setf (gethash subscription-id *subscriptions*)
+            (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing))
+      (when (null (gethash subscription-id *subscriptions*))
+        (remhash subscription-id *subscriptions*)))))
 
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
@@ -877,17 +880,18 @@
                                 (progn
                                   (log:debug "Closing WebSocket connection...")
                                   ;; Remove subscriptions for this client first
-                                  (maphash (lambda (sub-id sub-list)
-                                             (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
-                                               (if updated-list
-                                                   (setf (gethash sub-id *subscriptions*) updated-list)
-                                                   (remhash sub-id *subscriptions*))))
-                                           *subscriptions*)
-                                   ;; Remove client
-                                   (bordeaux-threads:with-lock-held (*clients-lock*)
-                                     (setf *clients* (remove ws *clients* :test #'eq))
-                                     (when (> *connection-count* 0)
-                                       (decf *connection-count*)))
+                                  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+                                    (maphash (lambda (sub-id sub-list)
+                                               (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
+                                                 (if updated-list
+                                                     (setf (gethash sub-id *subscriptions*) updated-list)
+                                                     (remhash sub-id *subscriptions*))))
+                                             *subscriptions*))
+                                  ;; Remove client
+                                  (bordeaux-threads:with-lock-held (*clients-lock*)
+                                    (setf *clients* (remove ws *clients* :test #'eq))
+                                    (when (> *connection-count* 0)
+                                      (decf *connection-count*)))
                                   (log:debug "Client disconnected, remaining: ~A" *connection-count*))
                               (error (e)
                                 (log:error "Error in close handler: ~A" e)))))
@@ -897,12 +901,13 @@
                             (handler-case
                                 (progn
                                   ;; Clean up on error
-                                  (maphash (lambda (sub-id sub-list)
-                                             (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
-                                               (if updated-list
-                                                   (setf (gethash sub-id *subscriptions*) updated-list)
-                                                   (remhash sub-id *subscriptions*))))
-                                           *subscriptions*)
+                                  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+                                    (maphash (lambda (sub-id sub-list)
+                                               (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
+                                                 (if updated-list
+                                                     (setf (gethash sub-id *subscriptions*) updated-list)
+                                                     (remhash sub-id *subscriptions*))))
+                                             *subscriptions*))
                                   (bordeaux-threads:with-lock-held (*clients-lock*)
                                     (setf *clients* (remove ws *clients* :test #'eq))
                                     (when (> *connection-count* 0)
@@ -994,15 +999,16 @@
           ;; Clean up orphaned subscriptions
           (let ((active-ws (bordeaux-threads:with-lock-held (*clients-lock*)
                              (copy-list *clients*))))
-            (maphash (lambda (sub-id sub-list)
-                       (let ((valid-subs (remove-if-not
-                                           (lambda (sub)
-                                             (member (getf sub :ws) active-ws :test #'eq))
-                                           sub-list)))
-                         (if valid-subs
-                             (setf (gethash sub-id *subscriptions*) valid-subs)
-                             (remhash sub-id *subscriptions*))))
-                     *subscriptions*))
+            (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+              (maphash (lambda (sub-id sub-list)
+                         (let ((valid-subs (remove-if-not
+                                             (lambda (sub)
+                                               (member (getf sub :ws) active-ws :test #'eq))
+                                             sub-list)))
+                           (if valid-subs
+                               (setf (gethash sub-id *subscriptions*) valid-subs)
+                               (remhash sub-id *subscriptions*))))
+                       *subscriptions*)))
           ;; Force garbage collection
           (sb-ext:gc :full t)
           (log:info "Cleanup: connections=~A subs=~A" *connection-count* (hash-table-count *subscriptions*)))
