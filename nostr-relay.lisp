@@ -205,8 +205,9 @@
 ;; Query with automatic reconnection
 (defmacro db-query (sql-query &rest params)
   "Query with automatic reconnection"
-  `(with-db-retry
-     (query ,sql-query ,@params)))
+  `(bordeaux-threads:with-lock-held (*db-query-lock*)
+     (with-db-retry
+       (query ,sql-query ,@params))))
 
 ;; Table creation
 (defun initialize ()
