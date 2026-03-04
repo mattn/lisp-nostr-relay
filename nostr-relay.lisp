@@ -789,21 +789,48 @@
           ;; Send OK response
           (let ((event-id (event-field "id" event)))
             (log:debug "Sending OK for event: ~A" event-id)
-            (send ws (encode-json-string (vector "OK" event-id t ""))))
+            (handler-case
+                (send ws (encode-json-string (vector "OK" event-id t "")))
+              (error (e)
+                (log:warn "Failed to send OK response: ~A" e))))
           ;; Broadcast to subscribed clients
-          (maphash (lambda (sub-id sub-list)
-                     (dolist (sub-info sub-list)
-                       (let ((sub-ws (getf sub-info :ws))
-                             (filters (getf sub-info :filters)))
-                         ;; Check if event matches any filter
-                         (when (some (lambda (filter) (match-filter event filter)) filters)
-                           (log:debug "Broadcasting event to subscription: ~A" sub-id)
-                           ;; Convert alist to hash table for encoding
-                           (let ((event-hash (make-hash-table :test 'equal)))
-                             (dolist (pair event)
-                               (setf (gethash (car pair) event-hash) (cdr pair)))
-                             (send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash))))))))
-                   *subscriptions*))
+          ;; Build event hash once for reuse
+          (let ((event-hash (make-hash-table :test 'equal)))
+            (dolist (pair event)
+              (setf (gethash (car pair) event-hash) (cdr pair)))
+            ;; Collect matching subscriptions under lock
+            (let ((broadcast-targets nil))
+              (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+                (maphash (lambda (sub-id sub-list)
+                           (dolist (sub-info sub-list)
+                             (let ((sub-ws (getf sub-info :ws))
+                                   (filters (getf sub-info :filters)))
+                               (when (and (eq (websocket-driver:ready-state sub-ws) :open)
+                                          (some (lambda (filter) (match-filter event filter)) filters))
+                                 (push (list sub-id sub-ws) broadcast-targets)))))
+                         *subscriptions*))
+              ;; Send to each target with individual error handling
+              (let ((dead-pairs nil))
+                (dolist (target broadcast-targets)
+                  (destructuring-bind (sub-id sub-ws) target
+                    (handler-case
+                        (progn
+                          (log:debug "Broadcasting event to subscription: ~A" sub-id)
+                          (send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash))))
+                      (error (e)
+                        (log:warn "Failed to broadcast to subscription ~A: ~A" sub-id e)
+                        (push (list sub-id sub-ws) dead-pairs)))))
+                ;; Clean up dead subscriptions
+                (when dead-pairs
+                  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+                    (dolist (dead dead-pairs)
+                      (destructuring-bind (sub-id sub-ws) dead
+                        (let ((existing (gethash sub-id *subscriptions*)))
+                          (let ((updated (remove-if (lambda (sub) (eq (getf sub :ws) sub-ws)) existing)))
+                            (if updated
+                                (setf (gethash sub-id *subscriptions*) updated)
+                                (remhash sub-id *subscriptions*))))))))))))
+
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (log:warn "Event verification failed: ~A" event-id)
