@@ -254,6 +254,25 @@
 (defvar *clients-lock* (bordeaux-threads:make-lock "clients"))
 (defvar *max-connections* 100)
 (defvar *connection-count* 0)
+(defvar *ws-send-locks* (make-hash-table :test 'eq))
+(defvar *ws-send-locks-lock* (bordeaux-threads:make-lock "ws-send-locks"))
+
+(defun get-ws-send-lock (ws)
+  "Get or create a per-WebSocket send lock to prevent concurrent frame writes."
+  (bordeaux-threads:with-lock-held (*ws-send-locks-lock*)
+    (or (gethash ws *ws-send-locks*)
+        (setf (gethash ws *ws-send-locks*)
+              (bordeaux-threads:make-lock "ws-send")))))
+
+(defun remove-ws-send-lock (ws)
+  "Remove the send lock for a disconnected WebSocket."
+  (bordeaux-threads:with-lock-held (*ws-send-locks-lock*)
+    (remhash ws *ws-send-locks*)))
+
+(defun ws-send (ws message)
+  "Thread-safe WebSocket send. Serializes frame writes to prevent interleaved bytes."
+  (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+    (websocket-driver:send ws message)))
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -652,10 +671,10 @@
                     ;; Check if event is expired (NIP-40)
                     (unless (is-expired event-alist)
                       (log:debug "Sending event: ~A" id)
-                      (send ws (encode-json-string (vector "EVENT" subscription-id event-hash))))))))))
+                      (ws-send ws (encode-json-string (vector "EVENT" subscription-id event-hash))))))))))
         ;; Send EOSE
         (log:debug "Sending EOSE for ~A" subscription-id)
-        (send ws (encode-json-string (vector "EOSE" subscription-id)))
+        (ws-send ws (encode-json-string (vector "EOSE" subscription-id)))
         ;; Save subscription (support multiple clients with same sub-id)
         (bordeaux-threads:with-lock-held (*subscriptions-lock*)
           (let ((existing (gethash subscription-id *subscriptions*)))
@@ -664,7 +683,7 @@
                         (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing))))))
     (error (e)
       (log:error "Error handling REQ: ~A" e)
-      (send ws (encode-json-string (vector "EOSE" subscription-id))))))
+      (ws-send ws (encode-json-string (vector "EOSE" subscription-id))))))
 
 (defun handle-deletion-event (event)
   "Handle kind 5 deletion events (NIP-09)"
@@ -770,13 +789,13 @@
     (when (is-expired event)
       (let ((event-id (event-field "id" event)))
         (log:info "Rejecting expired event (NIP-40): ~A" event-id)
-        (send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired (NIP-40)")))
+        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired (NIP-40)")))
         (return-from handle-event)))
     ;; Check for protected event (NIP-70)
     (when (has-protected-tag event)
       (let ((event-id (event-field "id" event)))
         (log:info "Rejecting protected event (NIP-70): ~A" event-id)
-        (send ws (encode-json-string (vector "OK" event-id yason:false "blocked: event contains '-' tag (NIP-70)")))
+        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
@@ -790,7 +809,7 @@
           (let ((event-id (event-field "id" event)))
             (log:debug "Sending OK for event: ~A" event-id)
             (handler-case
-                (send ws (encode-json-string (vector "OK" event-id t "")))
+                (ws-send ws (encode-json-string (vector "OK" event-id t "")))
               (error (e)
                 (log:warn "Failed to send OK response: ~A" e))))
           ;; Broadcast to subscribed clients
@@ -816,7 +835,7 @@
                     (handler-case
                         (progn
                           (log:debug "Broadcasting event to subscription: ~A" sub-id)
-                          (send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash))))
+                          (ws-send sub-ws (encode-json-string (vector "EVENT" sub-id event-hash))))
                       (error (e)
                         (log:warn "Failed to broadcast to subscription ~A: ~A" sub-id e)
                         (push (list sub-id sub-ws) dead-pairs)))))
@@ -834,7 +853,7 @@
         ;; Verification failed
         (let ((event-id (event-field "id" event)))
           (log:warn "Event verification failed: ~A" event-id)
-          (send ws (encode-json-string (vector "OK" event-id yason:false "invalid: signature verification failed")))))))
+          (ws-send ws (encode-json-string (vector "OK" event-id yason:false "invalid: signature verification failed")))))))
 
 (defun handle-close (subscription-id ws)
   "Handle CLOSE message"
@@ -919,6 +938,7 @@
                                     (setf *clients* (remove ws *clients* :test #'eq))
                                     (when (> *connection-count* 0)
                                       (decf *connection-count*)))
+                                  (remove-ws-send-lock ws)
                                   (log:debug "Client disconnected, remaining: ~A" *connection-count*))
                               (error (e)
                                 (log:error "Error in close handler: ~A" e)))))
@@ -939,6 +959,7 @@
                                     (setf *clients* (remove ws *clients* :test #'eq))
                                     (when (> *connection-count* 0)
                                       (decf *connection-count*)))
+                                  (remove-ws-send-lock ws)
                                   (log:debug "Client removed due to error, remaining: ~A" *connection-count*))
                               (error (e)
                                 (log:error "Error in error handler: ~A" e)))))
@@ -1018,11 +1039,17 @@
     (handler-case
         (progn
           ;; Clean up dead WebSocket connections
-          (bordeaux-threads:with-lock-held (*clients-lock*)
-            (setf *clients* (remove-if (lambda (ws)
-                                         (not (eq (websocket-driver:ready-state ws) :open)))
-                                       *clients*))
-            (setf *connection-count* (length *clients*)))
+          (let ((dead-clients nil))
+            (bordeaux-threads:with-lock-held (*clients-lock*)
+              (setf dead-clients (remove-if (lambda (ws)
+                                              (eq (websocket-driver:ready-state ws) :open))
+                                            *clients*))
+              (setf *clients* (remove-if (lambda (ws)
+                                           (not (eq (websocket-driver:ready-state ws) :open)))
+                                         *clients*))
+              (setf *connection-count* (length *clients*)))
+            (dolist (ws dead-clients)
+              (remove-ws-send-lock ws)))
           ;; Clean up orphaned subscriptions
           (let ((active-ws (bordeaux-threads:with-lock-held (*clients-lock*)
                              (copy-list *clients*))))
