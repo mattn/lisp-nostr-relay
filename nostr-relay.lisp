@@ -1031,7 +1031,7 @@
                             (handler-case
                                 (progn
                                   (cleanup-ws-state ws :error
-                                                    :details (princ-to-string error))
+                                                    :details (princ-to-string error)))
                               (error (e)
                                 (log:error "~A Error in error handler: ~A"
                                            (ws-log-prefix ws) e)))))
