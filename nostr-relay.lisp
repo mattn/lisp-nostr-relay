@@ -256,6 +256,9 @@
 (defvar *connection-count* 0)
 (defvar *ws-send-locks* (make-hash-table :test 'eq))
 (defvar *ws-send-locks-lock* (bordeaux-threads:make-lock "ws-send-locks"))
+(defvar *ws-meta* (make-hash-table :test 'eq))
+(defvar *ws-meta-lock* (bordeaux-threads:make-lock "ws-meta"))
+(defvar *next-ws-id* 0)
 
 (defun get-ws-send-lock (ws)
   "Get or create a per-WebSocket send lock to prevent concurrent frame writes."
@@ -269,10 +272,83 @@
   (bordeaux-threads:with-lock-held (*ws-send-locks-lock*)
     (remhash ws *ws-send-locks*)))
 
+(defun register-ws (ws env)
+  "Register metadata for a WebSocket connection and return it."
+  (let* ((headers (getf env :headers))
+         (peer (or (and headers (gethash "x-forwarded-for" headers))
+                   (getf env :remote-addr)
+                   (getf env :server-addr)
+                   "unknown"))
+         (meta (bordeaux-threads:with-lock-held (*ws-meta-lock*)
+                 (let ((id (incf *next-ws-id*)))
+                   (setf (gethash ws *ws-meta*)
+                         (list :id id
+                               :path (getf env :path-info)
+                               :peer peer
+                               :user-agent (and headers (gethash "user-agent" headers))))))))
+    meta))
+
+(defun ws-meta (ws)
+  "Get metadata for a WebSocket."
+  (bordeaux-threads:with-lock-held (*ws-meta-lock*)
+    (gethash ws *ws-meta*)))
+
+(defun unregister-ws (ws)
+  "Remove metadata for a WebSocket."
+  (bordeaux-threads:with-lock-held (*ws-meta-lock*)
+    (remhash ws *ws-meta*)))
+
+(defun ws-log-prefix (ws &optional meta)
+  "Format a stable log prefix for a WebSocket."
+  (let ((meta (or meta (ws-meta ws))))
+    (if meta
+        (format nil "ws#~A peer=~A path=~A"
+                (getf meta :id)
+                (getf meta :peer)
+                (getf meta :path))
+        (format nil "ws@~X" (sxhash ws)))))
+
+(defun cleanup-ws-state (ws cause &key details)
+  "Remove all state associated with WS and emit a summary log."
+  (let ((meta (ws-meta ws))
+        (ready-state (websocket-driver:ready-state ws))
+        (removed-subscriptions 0)
+        (removed-subscription-ids 0)
+        (remaining-clients 0))
+    (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+      (maphash (lambda (sub-id sub-list)
+                 (let* ((before (length sub-list))
+                        (updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list))
+                        (removed-count (- before (length updated-list))))
+                   (when (> removed-count 0)
+                     (incf removed-subscriptions removed-count)
+                     (when (null updated-list)
+                       (incf removed-subscription-ids)))
+                   (if updated-list
+                       (setf (gethash sub-id *subscriptions*) updated-list)
+                       (remhash sub-id *subscriptions*))))
+               *subscriptions*))
+    (bordeaux-threads:with-lock-held (*clients-lock*)
+      (setf *clients* (remove ws *clients* :test #'eq))
+      (setf *connection-count* (length *clients*))
+      (setf remaining-clients *connection-count*))
+    (remove-ws-send-lock ws)
+    (unregister-ws ws)
+    (log:info "~A cleanup cause=~A state=~A removed-subs=~A removed-sub-ids=~A remaining=~A~@[ details=~A~]"
+              (ws-log-prefix ws meta)
+              cause
+              ready-state
+              removed-subscriptions
+              removed-subscription-ids
+              remaining-clients
+              details)))
+
 (defun ws-send (ws message)
   "Thread-safe WebSocket send. Serializes frame writes to prevent interleaved bytes."
-  (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
-    (websocket-driver:send ws message)))
+  (when (eq (websocket-driver:ready-state ws) :open)
+    (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+      (when (eq (websocket-driver:ready-state ws) :open)
+        (websocket-driver:send ws message)))))
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -862,7 +938,11 @@
       (setf (gethash subscription-id *subscriptions*)
             (remove-if (lambda (sub) (eq (getf sub :ws) ws)) existing))
       (when (null (gethash subscription-id *subscriptions*))
-        (remhash subscription-id *subscriptions*)))))
+        (remhash subscription-id *subscriptions*))))
+  (log:info "~A client requested CLOSE sub-id=~A remaining-sub-ids=~A"
+            (ws-log-prefix ws)
+            subscription-id
+            (hash-table-count *subscriptions*)))
 
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
@@ -908,63 +988,56 @@
                     '(503 (:content-type "text/plain") ("Service Unavailable: Too many connections"))
                     ;; Accept connection
                     (let ((ws (make-server env)))
+                      (register-ws ws env)
                       (incf *connection-count*)
                       (push ws *clients*)
+                      (log:info "~A accepted connection total=~A"
+                                (ws-log-prefix ws)
+                                *connection-count*)
                       (on :message ws
                           (lambda (message)
                             (handler-case
                                 (progn
+                                  (log:debug "~A received frame bytes=~A state=~A"
+                                             (ws-log-prefix ws)
+                                             (length message)
+                                             (websocket-driver:ready-state ws))
                                   (handle-nostr-message ws message)
                                   ;; Explicitly allow GC of message
                                   (setf message nil))
                               (error (e)
-                                (log:error "ERROR in WebSocket message handler: ~A" e)))))
+                                (log:error "~A ERROR in WebSocket message handler: ~A"
+                                           (ws-log-prefix ws) e)))))
                       (on :close ws
                           (lambda (&key code reason)
-                            (declare (ignore code reason))
                             (handler-case
                                 (progn
-                                  (log:debug "Closing WebSocket connection...")
-                                  ;; Remove subscriptions for this client first
-                                  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
-                                    (maphash (lambda (sub-id sub-list)
-                                               (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
-                                                 (if updated-list
-                                                     (setf (gethash sub-id *subscriptions*) updated-list)
-                                                     (remhash sub-id *subscriptions*))))
-                                             *subscriptions*))
-                                  ;; Remove client
-                                  (bordeaux-threads:with-lock-held (*clients-lock*)
-                                    (setf *clients* (remove ws *clients* :test #'eq))
-                                    (when (> *connection-count* 0)
-                                      (decf *connection-count*)))
-                                  (remove-ws-send-lock ws)
-                                  (log:debug "Client disconnected, remaining: ~A" *connection-count*))
+                                  (log:info "~A close event code=~A reason=~S state=~A"
+                                            (ws-log-prefix ws)
+                                            code
+                                            reason
+                                            (websocket-driver:ready-state ws))
+                                  (cleanup-ws-state ws :close
+                                                    :details (format nil "code=~A reason=~S" code reason)))
                               (error (e)
-                                (log:error "Error in close handler: ~A" e)))))
+                                (log:error "~A Error in close handler: ~A"
+                                           (ws-log-prefix ws) e)))))
                       (on :error ws
                           (lambda (error)
-                            (log:error "WebSocket error: ~A" error)
+                            (log:error "~A WebSocket error: ~A state=~A"
+                                       (ws-log-prefix ws)
+                                       error
+                                       (websocket-driver:ready-state ws))
                             (handler-case
                                 (progn
-                                  ;; Clean up on error
-                                  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
-                                    (maphash (lambda (sub-id sub-list)
-                                               (let ((updated-list (remove-if (lambda (sub) (eq (getf sub :ws) ws)) sub-list)))
-                                                 (if updated-list
-                                                     (setf (gethash sub-id *subscriptions*) updated-list)
-                                                     (remhash sub-id *subscriptions*))))
-                                             *subscriptions*))
-                                  (bordeaux-threads:with-lock-held (*clients-lock*)
-                                    (setf *clients* (remove ws *clients* :test #'eq))
-                                    (when (> *connection-count* 0)
-                                      (decf *connection-count*)))
-                                  (remove-ws-send-lock ws)
-                                  (log:debug "Client removed due to error, remaining: ~A" *connection-count*))
+                                  (cleanup-ws-state ws :error
+                                                    :details (princ-to-string error))
                               (error (e)
-                                (log:error "Error in error handler: ~A" e)))))
+                                (log:error "~A Error in error handler: ~A"
+                                           (ws-log-prefix ws) e)))))
                       (lambda (responder)
                         (declare (ignore responder))
+                        (log:info "~A starting websocket session" (ws-log-prefix ws))
                         (start-connection ws)))))
               ;; Normal HTTP request
               (cond
