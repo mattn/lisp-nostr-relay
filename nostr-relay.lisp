@@ -260,6 +260,15 @@
 (defvar *ws-meta-lock* (bordeaux-threads:make-lock "ws-meta"))
 (defvar *next-ws-id* 0)
 
+(defparameter *ws-ping-interval*
+  (parse-integer (or (uiop:getenv "WS_PING_INTERVAL") "30")))
+(defparameter *ws-pong-timeout*
+  (parse-integer (or (uiop:getenv "WS_PONG_TIMEOUT") "90")))
+
+(defun unix-time ()
+  "Return the current UNIX time in seconds."
+  (- (get-universal-time) 2208988800))
+
 (defun get-ws-send-lock (ws)
   "Get or create a per-WebSocket send lock to prevent concurrent frame writes."
   (bordeaux-threads:with-lock-held (*ws-send-locks-lock*)
@@ -279,13 +288,17 @@
                    (getf env :remote-addr)
                    (getf env :server-addr)
                    "unknown"))
+         (now (unix-time))
          (meta (bordeaux-threads:with-lock-held (*ws-meta-lock*)
                  (let ((id (incf *next-ws-id*)))
                    (setf (gethash ws *ws-meta*)
                          (list :id id
                                :path (getf env :path-info)
                                :peer peer
-                               :user-agent (and headers (gethash "user-agent" headers))))))))
+                               :user-agent (and headers (gethash "user-agent" headers))
+                               :connected-at now
+                               :last-seen now
+                               :last-pong now))))))
     meta))
 
 (defun ws-meta (ws)
@@ -297,6 +310,14 @@
   "Remove metadata for a WebSocket."
   (bordeaux-threads:with-lock-held (*ws-meta-lock*)
     (remhash ws *ws-meta*)))
+
+(defun update-ws-meta (ws key value)
+  "Update a metadata entry for WS."
+  (bordeaux-threads:with-lock-held (*ws-meta-lock*)
+    (let ((meta (gethash ws *ws-meta*)))
+      (when meta
+        (setf (getf meta key) value)
+        meta))))
 
 (defun ws-log-prefix (ws &optional meta)
   "Format a stable log prefix for a WebSocket."
@@ -349,6 +370,22 @@
     (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
       (when (eq (websocket-driver:ready-state ws) :open)
         (websocket-driver:send ws message)))))
+
+(defun ws-send-ping (ws)
+  "Send a ping frame and record the pong when it arrives."
+  (when (eq (websocket-driver:ready-state ws) :open)
+    (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+      (when (eq (websocket-driver:ready-state ws) :open)
+        (websocket-driver:send-ping
+         ws
+         (babel:string-to-octets (format nil "~A" (unix-time)) :encoding :utf-8)
+         (lambda ()
+           (update-ws-meta ws :last-pong (unix-time))))))))
+
+(defun ws-close (ws &optional (reason "heartbeat timeout") (code 1001))
+  "Close WS while holding the send lock to avoid interleaving with sends."
+  (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+    (websocket-driver:close-connection ws reason code)))
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -998,6 +1035,7 @@
                           (lambda (message)
                             (handler-case
                                 (progn
+                                  (update-ws-meta ws :last-seen (unix-time))
                                   (log:debug "~A received frame bytes=~A state=~A"
                                              (ws-log-prefix ws)
                                              (length message)
@@ -1142,6 +1180,31 @@
       (error (e)
         (log:error "Error in cleanup thread: ~A" e)))))
 
+(defun heartbeat-thread ()
+  "Keep WebSocket connections alive and close stale ones."
+  (loop
+    (sleep *ws-ping-interval*)
+    (handler-case
+        (let ((clients (bordeaux-threads:with-lock-held (*clients-lock*)
+                         (copy-list *clients*)))
+              (now (unix-time)))
+          (dolist (ws clients)
+            (let ((meta (ws-meta ws)))
+              (when (and meta (eq (websocket-driver:ready-state ws) :open))
+                (let ((last-activity (max (or (getf meta :last-pong) 0)
+                                          (or (getf meta :last-seen) 0)
+                                          (or (getf meta :connected-at) 0))))
+                  (if (>= (- now last-activity) *ws-pong-timeout*)
+                      (progn
+                        (log:warn "~A heartbeat timeout last-activity=~A timeout=~A"
+                                  (ws-log-prefix ws meta)
+                                  last-activity
+                                  *ws-pong-timeout*)
+                        (ignore-errors (ws-close ws "heartbeat timeout" 1001)))
+                      (ignore-errors (ws-send-ping ws))))))))
+      (error (e)
+        (log:error "Error in heartbeat thread: ~A" e)))))
+
 (defun main ()
   ;; Database initialization and server startup
   (log:info "Starting application")
@@ -1152,10 +1215,14 @@
                                            *compile-file-pathname*
                                            (truename ".")
                                            #p"/app/")))
-  ;; Start cleanup thread
+  ;; Start background maintenance threads
   (bordeaux-threads:make-thread #'cleanup-thread :name "cleanup-thread")
+  (bordeaux-threads:make-thread #'heartbeat-thread :name "heartbeat-thread")
   (let ((port (parse-integer (or (uiop:getenv "PORT") "5000"))))
     (log:info "Static files path: ~A" *public-path*)
+    (log:info "WebSocket heartbeat: interval=~As timeout=~As"
+              *ws-ping-interval*
+              *ws-pong-timeout*)
     (log:info "Starting server on 0.0.0.0:~A" port)
     (clack:clackup *app*
                    :server *handler*
