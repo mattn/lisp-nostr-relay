@@ -48,6 +48,20 @@
                                                            :conversion-pattern "%d{%Y-%m-%d %H:%M:%S} [%p] %m%n")))
 (log4cl:log-config :info)
 
+(defun configure-log-level ()
+  "Set the log4cl root level from the LOG_LEVEL env var (default info).
+   Read at runtime (from MAIN) so it takes effect in a dumped
+   save-lisp-and-die image, where top-level forms do not re-run."
+  (let* ((name (string-downcase (or (uiop:getenv "LOG_LEVEL") "info")))
+         (level (cond ((string= name "error") :error)
+                      ((string= name "warn")  :warn)
+                      ((string= name "info")  :info)
+                      ((string= name "debug") :debug)
+                      ((string= name "trace") :trace)
+                      (t :info))))
+    (log4cl:log-config level)
+    level))
+
 (defparameter *handler* :hunchentoot)
 (defparameter *hunchentoot-settings*
   '(:thread-pool-size 200
@@ -264,6 +278,12 @@
   (parse-integer (or (uiop:getenv "WS_PING_INTERVAL") "30")))
 (defparameter *ws-pong-timeout*
   (parse-integer (or (uiop:getenv "WS_PONG_TIMEOUT") "90")))
+;; Wall-clock cap (seconds) for a single WebSocket send/close. A stale half-open
+;; client whose socket buffer is full would otherwise block the sending thread
+;; (and the per-ws send lock) forever, stalling all broadcasts. On expiry the
+;; send is aborted and the subscription is treated as dead.
+(defparameter *ws-send-timeout*
+  (parse-integer (or (uiop:getenv "WS_SEND_TIMEOUT") "5")))
 
 (defun unix-time ()
   "Return the current UNIX time in seconds."
@@ -364,28 +384,40 @@
               remaining-clients
               details)))
 
+(defmacro with-send-timeout (&body body)
+  "Run BODY under *ws-send-timeout* wall-clock seconds. SB-EXT:TIMEOUT is a
+   SERIOUS-CONDITION, not an ERROR, so it would slip past callers' (error (e) ...)
+   handlers; re-signal it as a plain ERROR so dead-client cleanup runs."
+  `(handler-case
+       (sb-ext:with-timeout *ws-send-timeout* ,@body)
+     (sb-ext:timeout ()
+       (error "WebSocket send timed out after ~As" *ws-send-timeout*))))
+
 (defun ws-send (ws message)
   "Thread-safe WebSocket send. Serializes frame writes to prevent interleaved bytes."
   (when (eq (websocket-driver:ready-state ws) :open)
-    (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
-      (when (eq (websocket-driver:ready-state ws) :open)
-        (websocket-driver:send ws message)))))
+    (with-send-timeout
+      (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+        (when (eq (websocket-driver:ready-state ws) :open)
+          (websocket-driver:send ws message))))))
 
 (defun ws-send-ping (ws)
   "Send a ping frame and record the pong when it arrives."
   (when (eq (websocket-driver:ready-state ws) :open)
-    (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
-      (when (eq (websocket-driver:ready-state ws) :open)
-        (websocket-driver:send-ping
-         ws
-         (babel:string-to-octets (format nil "~A" (unix-time)) :encoding :utf-8)
-         (lambda ()
-           (update-ws-meta ws :last-pong (unix-time))))))))
+    (with-send-timeout
+      (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+        (when (eq (websocket-driver:ready-state ws) :open)
+          (websocket-driver:send-ping
+           ws
+           (babel:string-to-octets (format nil "~A" (unix-time)) :encoding :utf-8)
+           (lambda ()
+             (update-ws-meta ws :last-pong (unix-time)))))))))
 
 (defun ws-close (ws &optional (reason "heartbeat timeout") (code 1001))
   "Close WS while holding the send lock to avoid interleaving with sends."
-  (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
-    (websocket-driver:close-connection ws reason code)))
+  (with-send-timeout
+    (bordeaux-threads:with-lock-held ((get-ws-send-lock ws))
+      (websocket-driver:close-connection ws reason code))))
 
 ;; Helper function to get event field (handles both string and keyword keys)
 (defun event-field (field event)
@@ -942,7 +974,8 @@
                                  (push (list sub-id sub-ws) broadcast-targets)))))
                          *subscriptions*))
               ;; Send to each target with individual error handling
-              (let ((dead-pairs nil))
+              (let ((dead-pairs nil)
+                    (event-id (event-field "id" event)))
                 (dolist (target broadcast-targets)
                   (destructuring-bind (sub-id sub-ws) target
                     (handler-case
@@ -952,6 +985,10 @@
                       (error (e)
                         (log:warn "Failed to broadcast to subscription ~A: ~A" sub-id e)
                         (push (list sub-id sub-ws) dead-pairs)))))
+                ;; One-line INFO summary so streaming is observable without DEBUG.
+                (log:info "Broadcast ~A to ~A subscription(s)~@[, ~A dead dropped~]"
+                          event-id (length broadcast-targets)
+                          (and dead-pairs (length dead-pairs)))
                 ;; Clean up dead subscriptions
                 (when dead-pairs
                   (bordeaux-threads:with-lock-held (*subscriptions-lock*)
@@ -985,21 +1022,25 @@
   "Handle Nostr message"
   (handler-case
       (let ((msg (yason:parse message :object-as :alist)))
-        (log:info "Received message: ~A" message)
-        (log:info "Parsed as: ~A" msg)
+        ;; Full payloads are large (REQ filters can hold hundreds of ids); keep
+        ;; them at DEBUG so INFO stays a readable signal and rare WARN/ERROR
+        ;; lines are not flushed out of the container log ring by the noise.
+        (log:debug "Received message: ~A" message)
+        (log:debug "Parsed as: ~A" msg)
         (when (and (listp msg) (> (length msg) 0))
           (let ((type (first msg)))
-            (log:info "Message type: ~A" type)
+            (log:debug "Message type: ~A" type)
             (cond
               ((equal type "EVENT")
                (when (>= (length msg) 2)
-                 (log:info "Handling EVENT")
+                 (log:debug "Handling EVENT")
                  (handle-event ws (second msg))))
               ((equal type "REQ")
                (when (>= (length msg) 2)
                  (let ((sub-id (second msg))
                        (filters (cddr msg)))
-                   (log:info "Handling REQ: sub-id=~A, filters=~A" sub-id filters)
+                   (log:info "Handling REQ: sub-id=~A filters=~A" sub-id (length filters))
+                   (log:debug "REQ ~A filters=~A" sub-id filters)
                    (handle-req ws sub-id filters))))
               ((equal type "CLOSE")
                (when (>= (length msg) 2)
@@ -1207,6 +1248,7 @@
 
 (defun main ()
   ;; Database initialization and server startup
+  (configure-log-level)
   (log:info "Starting application")
   (initialize)
   (connect-db)
@@ -1220,9 +1262,10 @@
   (bordeaux-threads:make-thread #'heartbeat-thread :name "heartbeat-thread")
   (let ((port (parse-integer (or (uiop:getenv "PORT") "5000"))))
     (log:info "Static files path: ~A" *public-path*)
-    (log:info "WebSocket heartbeat: interval=~As timeout=~As"
+    (log:info "WebSocket heartbeat: interval=~As pong-timeout=~As send-timeout=~As"
               *ws-ping-interval*
-              *ws-pong-timeout*)
+              *ws-pong-timeout*
+              *ws-send-timeout*)
     (log:info "Starting server on 0.0.0.0:~A" port)
     (clack:clackup *app*
                    :server *handler*
