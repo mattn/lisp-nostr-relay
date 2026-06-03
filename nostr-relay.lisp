@@ -1128,6 +1128,11 @@
                         (relay-pubkey (or (uiop:getenv "RELAY_PUBKEY") ""))
                         (relay-contact (or (uiop:getenv "RELAY_CONTACT") ""))
                         (relay-icon (or (uiop:getenv "RELAY_ICON") ""))
+                        (relay-countries (remove-if (lambda (c) (string= c ""))
+                                                    (mapcar (lambda (s)
+                                                              (string-trim " " s))
+                                                            (split-sequence:split-sequence
+                                                             #\, (or (uiop:getenv "RELAY_COUNTRIES") "JP")))))
                         (info (make-hash-table :test 'equal)))
                    (setf (gethash "name" info) relay-name)
                    (setf (gethash "description" info) relay-description)
@@ -1137,6 +1142,9 @@
                      (setf (gethash "contact" info) relay-contact))
                    (when (not (string= relay-icon ""))
                      (setf (gethash "icon" info) relay-icon))
+                   (when relay-countries
+                     (setf (gethash "relay_countries" info)
+                           (coerce relay-countries 'vector)))
                    (setf (gethash "supported_nips" info)
                          (vector 1 2 4 9 11 12 15 16 20 22 28 33 40 50 62 70))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
