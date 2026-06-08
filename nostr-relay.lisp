@@ -301,13 +301,25 @@
   (bordeaux-threads:with-lock-held (*ws-send-locks-lock*)
     (remhash ws *ws-send-locks*)))
 
+(defun extract-client-ip (env)
+  "Extract the real client IP from proxy headers (Cloudflare Tunnel / reverse
+proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
+  (let ((headers (getf env :headers)))
+    (or (when headers
+          (loop for name in '("cf-connecting-ip" "x-forwarded-for" "x-real-ip")
+                for value = (gethash name headers)
+                when (and value (> (length value) 0))
+                  ;; X-Forwarded-For may be a comma separated list; take the
+                  ;; first (original client) entry.
+                  return (string-trim " " (first (split-sequence:split-sequence #\, value)))))
+        (getf env :remote-addr)
+        (getf env :server-addr)
+        "unknown")))
+
 (defun register-ws (ws env)
   "Register metadata for a WebSocket connection and return it."
   (let* ((headers (getf env :headers))
-         (peer (or (and headers (gethash "x-forwarded-for" headers))
-                   (getf env :remote-addr)
-                   (getf env :server-addr)
-                   "unknown"))
+         (peer (extract-client-ip env))
          (now (unix-time))
          (meta (bordeaux-threads:with-lock-held (*ws-meta-lock*)
                  (let ((id (incf *next-ws-id*)))
