@@ -539,6 +539,84 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
       (log:error "Event verification error: ~A" e)
       nil)))
 
+;; Delegated event signing (NIP-26)
+(defun hex-string-p (string)
+  "Check if string consists only of hexadecimal characters"
+  (and (stringp string)
+       (every (lambda (ch) (digit-char-p ch 16)) string)))
+
+(defun get-delegation-tag (event)
+  "Extract 'delegation' tag from event tags (NIP-26)"
+  (let ((tags (event-field "tags" event)))
+    (when tags
+      (let ((tag-list (if (vectorp tags) (coerce tags 'list) tags)))
+        (dolist (tag tag-list)
+          (let ((tag-item (if (vectorp tag) (coerce tag 'list) tag)))
+            (when (and (listp tag-item)
+                       (>= (length tag-item) 1)
+                       (equal (first tag-item) "delegation"))
+              (return-from get-delegation-tag tag-item))))))))
+
+(defun validate-delegation-conditions (event conditions)
+  "Check that event satisfies the delegation conditions query string (NIP-26).
+   Conditions are &-separated: kind=<int>, created_at<<ts>, created_at><ts>."
+  (let ((event-kind (event-field "kind" event))
+        (event-created-at (event-field "created_at" event))
+        (kind-condition-seen nil)
+        (kind-allowed nil))
+    (dolist (condition (split-sequence:split-sequence #\& conditions))
+      (cond
+        ;; kind=<int>: event kind must match one of the listed kinds
+        ((eql 0 (search "kind=" condition))
+         (setf kind-condition-seen t)
+         (let ((allowed-kind (ignore-errors (parse-integer (subseq condition 5)))))
+           (when (and allowed-kind (eql event-kind allowed-kind))
+             (setf kind-allowed t))))
+        ;; created_at<<ts>: event must be created before <ts>
+        ((eql 0 (search "created_at<" condition))
+         (let ((max-time (ignore-errors (parse-integer (subseq condition 11)))))
+           (when (and max-time
+                      (or (not (integerp event-created-at))
+                          (>= event-created-at max-time)))
+             (return-from validate-delegation-conditions nil))))
+        ;; created_at><ts>: event must be created after <ts>
+        ((eql 0 (search "created_at>" condition))
+         (let ((min-time (ignore-errors (parse-integer (subseq condition 11)))))
+           (when (and min-time
+                      (or (not (integerp event-created-at))
+                          (<= event-created-at min-time)))
+             (return-from validate-delegation-conditions nil))))))
+    (or (not kind-condition-seen) kind-allowed)))
+
+(defun verify-delegation-signature (delegatee-pubkey delegator-pubkey conditions sig)
+  "Verify delegation token signature (NIP-26). The token is the SHA-256 of
+   'nostr:delegation:<delegatee pubkey>:<conditions>' signed by the delegator
+   with a BIP340 Schnorr signature."
+  (let* ((token (format nil "nostr:delegation:~A:~A" delegatee-pubkey conditions))
+         (hash (sha256-hex token)))
+    (verify-schnorr-signature delegator-pubkey hash sig)))
+
+(defun validate-delegation (event)
+  "Validate 'delegation' tag if present (NIP-26).
+   Events without a delegation tag are always valid."
+  (let ((delegation-tag (get-delegation-tag event)))
+    (if (null delegation-tag)
+        t
+        (let ((delegator-pubkey (second delegation-tag))
+              (conditions (third delegation-tag))
+              (sig (fourth delegation-tag)))
+          (and (= (length delegation-tag) 4)
+               (stringp delegator-pubkey)
+               (= (length delegator-pubkey) 64)
+               (hex-string-p delegator-pubkey)
+               (stringp conditions)
+               (> (length conditions) 0)
+               (stringp sig)
+               (> (length sig) 0)
+               (validate-delegation-conditions event conditions)
+               (verify-delegation-signature (event-field "pubkey" event)
+                                            delegator-pubkey conditions sig))))))
+
 (defun is-replaceable (kind)
   "Check if event kind is replaceable (kind 0, 3, or 10000-19999)"
   (or (= kind 0)
@@ -954,6 +1032,12 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         (log:info "Rejecting protected event (NIP-70): ~A" event-id)
         (ws-send ws (encode-json-string (vector "OK" event-id yason:false "blocked: event contains '-' tag (NIP-70)")))
         (return-from handle-event)))
+    ;; Check delegation tag (NIP-26)
+    (unless (validate-delegation event)
+      (let ((event-id (event-field "id" event)))
+        (log:info "Rejecting event with invalid delegation (NIP-26): ~A" event-id)
+        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "invalid: delegation verification failed (NIP-26)")))
+        (return-from handle-event)))
     ;; Verify event
     (if (verify-event event)
         (progn
@@ -1158,7 +1242,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                      (setf (gethash "relay_countries" info)
                            (coerce relay-countries 'vector)))
                    (setf (gethash "supported_nips" info)
-                         (vector 1 2 4 9 11 12 15 16 20 22 28 33 40 50 62 70))
+                         (vector 1 2 4 9 11 12 15 16 20 22 26 28 33 40 50 62 70))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
                    (let ((limitation (make-hash-table :test 'equal)))
