@@ -594,7 +594,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind
-                      (encode-json-to-string tags)
+                      (encode-json-string tags)
                       content sig)
              ;; Delete older events with same pubkey and kind
              (db-execute "DELETE FROM event WHERE pubkey = $1 AND kind = $2 AND created_at < $3"
