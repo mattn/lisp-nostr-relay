@@ -838,10 +838,14 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
               (when (stringp key)
                 (when (and (> (length key) 1) (char= (char key 0) #\#))
                   (when (and value (listp value))
-                    (dolist (tag-value value)
-                      (incf param-counter)
-                      (push tag-value all-params)
-                      (push (format nil "$~A = ANY(tagvalues)" param-counter) conditions))))))))
+                    ;; Values of one tag filter are alternatives (NIP-01): OR
+                    ;; them together, matching match-filter's behavior.
+                    (let ((placeholders nil))
+                      (dolist (tag-value value)
+                        (incf param-counter)
+                        (push tag-value all-params)
+                        (push (format nil "$~A = ANY(tagvalues)" param-counter) placeholders))
+                      (push (format nil "(~{~A~^ OR ~})" (reverse placeholders)) conditions))))))))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
     ;; Add limit
