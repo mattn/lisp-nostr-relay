@@ -723,7 +723,8 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         (filter-kinds (event-field "kinds" filter))
         (filter-authors (event-field "authors" filter))
         (filter-since (event-field "since" filter))
-        (filter-until (event-field "until" filter)))
+        (filter-until (event-field "until" filter))
+        (filter-search (event-field "search" filter)))
     ;; Check ids filter
     (when (and filter-ids
                (not (some (lambda (fid)
@@ -751,6 +752,16 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
     (when (and filter-until event-created-at
                (> event-created-at filter-until))
       (return-from match-filter nil))
+    ;; Check search filter (NIP-50): all words must appear in content
+    (when (and (stringp filter-search) (> (length filter-search) 0))
+      (let ((content (event-field "content" event)))
+        (unless (and (stringp content)
+                     (let ((content-lower (string-downcase content)))
+                       (every (lambda (word)
+                                (or (string= word "")
+                                    (search (string-downcase word) content-lower)))
+                              (split-sequence:split-sequence #\Space filter-search))))
+          (return-from match-filter nil))))
     ;; Check tag filters (#e, #p, etc.)
     (let ((tag-list (when event-tags
                       (if (vectorp event-tags) (coerce event-tags 'list) event-tags))))
@@ -777,6 +788,14 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                   (return-from match-filter nil))))))))
     t))
 
+(defun escape-like-pattern (string)
+  "Escape LIKE/ILIKE wildcard characters in STRING."
+  (with-output-to-string (s)
+    (loop for ch across string
+          do (when (or (char= ch #\%) (char= ch #\_) (char= ch #\\))
+               (write-char #\\ s))
+             (write-char ch s))))
+
 (defun build-query (filters)
   "Build SQL query from filters with parameterized queries"
   (let ((filter-conditions nil)
@@ -790,6 +809,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
             (since (event-field "since" filter))
             (until (event-field "until" filter))
             (limit (event-field "limit" filter))
+            (search-term (event-field "search" filter))
             (conditions nil))
         ;; Filters are OR-ed together, so honor the largest requested limit
         ;; (capped below) instead of letting one small filter starve the rest.
@@ -839,6 +859,13 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
           (incf param-counter)
           (push until all-params)
           (push (format nil "created_at <= $~A" param-counter) conditions))
+        ;; NIP-50 search: words are ANDed, matched case-insensitively in content
+        (when (and (stringp search-term) (> (length search-term) 0))
+          (dolist (word (remove-if (lambda (w) (string= w ""))
+                                   (split-sequence:split-sequence #\Space search-term)))
+            (incf param-counter)
+            (push (concatenate 'string "%" (escape-like-pattern word) "%") all-params)
+            (push (format nil "content ILIKE $~A" param-counter) conditions)))
         ;; Handle tag filters
         (dolist (pair filter)
           (when (consp pair)
