@@ -686,11 +686,15 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
             ;; Parameterized replaceable events: replace if newer with same d tag
             ((is-parameterized-replaceable kind)
              (let ((d-tag (get-d-tag tags)))
+               ;; Match on the d tag itself (missing d tag counts as ""), not
+               ;; on tagvalues, which contains every single-letter tag value
+               ;; and would match e.g. an unrelated e tag.
                (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
                          SELECT $1, $2, $3, $4, $5::jsonb, $6, $7
                          WHERE NOT EXISTS (SELECT 1 FROM event
                                            WHERE pubkey = $2 AND kind = $4 AND created_at > $3
-                                           AND $8 = ANY(tagvalues))
+                                           AND COALESCE((SELECT t->>1 FROM jsonb_array_elements(tags) AS t
+                                                         WHERE t->>0 = 'd' LIMIT 1), '') = $8)
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind
                         (encode-json-string tags)
@@ -698,7 +702,8 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                ;; Delete older events with same pubkey, kind, and d tag
                (db-execute "DELETE FROM event
                          WHERE pubkey = $1 AND kind = $2 AND created_at < $3
-                         AND $4 = ANY(tagvalues)"
+                         AND COALESCE((SELECT t->>1 FROM jsonb_array_elements(tags) AS t
+                                       WHERE t->>0 = 'd' LIMIT 1), '') = $4"
                         pubkey kind created-at d-tag)))
 
             ;; Regular events
@@ -1034,7 +1039,9 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                                  (d-tag (third parts)))
                              (when (and kind (string= target-pubkey pubkey))
                                (log:info "Deleting parameterized event ~A:~A:~A" kind pubkey d-tag)
-                               (db-execute "DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND $3 = ANY(tagvalues)"
+                               (db-execute "DELETE FROM event WHERE kind = $1 AND pubkey = $2
+                                            AND COALESCE((SELECT t->>1 FROM jsonb_array_elements(tags) AS t
+                                                          WHERE t->>0 = 'd' LIMIT 1), '') = $3"
                                            kind pubkey d-tag))))))))
                 (error (e)
                   (log:error "ERROR in tag processing: ~A" e))))))))))
