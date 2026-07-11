@@ -908,9 +908,16 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
             (log:debug "SQL: ~A" sql)
             (log:debug "Params: ~A" params)
             (log:debug "Param count: ~A, Expected: ~A" (length params) limit-param-num)
+            ;; The parameter list is only known at runtime, so go through
+            ;; cl-postgres prepared statements instead of EVAL-ing a QUERY
+            ;; form, which compiled on every REQ and evaluated client-supplied
+            ;; values as Lisp forms.
             (let ((results (bordeaux-threads:with-lock-held (*db-query-lock*)
                              (with-db-retry
-                               (eval `(query ,sql ,@params))))))
+                               (progn
+                                 (cl-postgres:prepare-query postmodern:*database* "" sql)
+                                 (cl-postgres:exec-prepared postmodern:*database* "" params
+                                                            'cl-postgres:list-row-reader))))))
               (log:debug "Results count: ~A" (length results))
               ;; Send matched events
               (dolist (row results)
