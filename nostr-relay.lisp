@@ -1124,8 +1124,9 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
   (let ((expiration (get-expiration-timestamp event)))
     (when expiration
       (let ((current-time (get-universal-time)))
-        ;; Unix timestamp to Universal time conversion: add 2208988800
-        (< expiration (- current-time 2208988800))))))
+        ;; NIP-40: expired when the expiration is on or before the current
+        ;; time (unix epoch = universal time - 2208988800).
+        (<= expiration (- current-time 2208988800))))))
 
 (defun has-protected-tag (event)
   "Check if event has a '-' tag (NIP-70 Protected Events)"
