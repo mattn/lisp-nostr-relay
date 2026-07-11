@@ -1119,6 +1119,10 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
           (let ((event-hash (make-hash-table :test 'equal)))
             (dolist (pair event)
               (setf (gethash (car pair) event-hash) (cdr pair)))
+            ;; yason parses [] as NIL, which would re-encode as null; an empty
+            ;; tags array must stay an array in the broadcast JSON.
+            (when (null (gethash "tags" event-hash))
+              (setf (gethash "tags" event-hash) (vector)))
             ;; Collect matching subscriptions under lock
             (let ((broadcast-targets nil))
               (bordeaux-threads:with-lock-held (*subscriptions-lock*)
