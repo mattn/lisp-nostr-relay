@@ -19,7 +19,7 @@
                    (t nil))))
     (if target
         (load target)
-        (error nil "setup.lisp not found in ~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
+        (error "setup.lisp not found in ~A" "~/.quicklisp/, ~/.roswell/, ~/.ros/"))))
 
 (ql:quickload '(:websocket-driver :clack :clack-handler-hunchentoot :yason :postmodern :ironclad :babel :alexandria :secp256k1 :bordeaux-threads :split-sequence :log4cl) :silent t)
 
