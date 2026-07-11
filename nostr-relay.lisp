@@ -285,6 +285,15 @@
 (defparameter *ws-send-timeout*
   (parse-integer (or (uiop:getenv "WS_SEND_TIMEOUT") "5")))
 
+;; Limits advertised in the NIP-11 limitation object; enforced on incoming
+;; messages, REQ subscriptions and EVENT submissions.
+(defparameter *max-message-length* 65536)
+(defparameter *max-subscriptions* 20)
+(defparameter *max-filters* 10)
+(defparameter *max-subid-length* 100)
+(defparameter *max-event-tags* 2000)
+(defparameter *max-content-length* 65536)
+
 (defun unix-time ()
   "Return the current UNIX time in seconds."
   (- (get-universal-time) 2208988800))
@@ -899,6 +908,18 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
   (bordeaux-threads:with-lock-held (*clients-lock*)
     (setf *clients* (remove client *clients*))))
 
+(defun ws-subscription-count (ws &optional exclude-sub-id)
+  "Number of subscription ids WS currently holds, optionally not counting
+   EXCLUDE-SUB-ID (so replacing an existing subscription stays allowed)."
+  (bordeaux-threads:with-lock-held (*subscriptions-lock*)
+    (let ((count 0))
+      (maphash (lambda (sub-id sub-list)
+                 (when (and (not (equal sub-id exclude-sub-id))
+                            (some (lambda (sub) (eq (getf sub :ws) ws)) sub-list))
+                   (incf count)))
+               *subscriptions*)
+      count)))
+
 (defun handle-req (ws subscription-id filters)
   "Handle REQ message"
   (handler-case
@@ -1142,6 +1163,22 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
   "Handle EVENT message"
   (let ((event event-data))
     (log:debug "Storing event: ~A" event)
+    ;; Enforce advertised NIP-11 limits
+    (let ((content (event-field "content" event))
+          (tags (event-field "tags" event))
+          (event-id (event-field "id" event)))
+      (when (and (stringp content) (> (length content) *max-content-length*))
+        (log:info "Rejecting event with too long content: ~A" event-id)
+        (ws-send ws (encode-json-string
+                     (vector "OK" event-id yason:false
+                             (format nil "invalid: content too long (max ~A)" *max-content-length*))))
+        (return-from handle-event))
+      (when (and (typep tags 'sequence) (> (length tags) *max-event-tags*))
+        (log:info "Rejecting event with too many tags: ~A" event-id)
+        (ws-send ws (encode-json-string
+                     (vector "OK" event-id yason:false
+                             (format nil "invalid: too many tags (max ~A)" *max-event-tags*))))
+        (return-from handle-event)))
     ;; Check for expired event (NIP-40)
     (when (is-expired event)
       (let ((event-id (event-field "id" event)))
@@ -1257,7 +1294,13 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
 (defun handle-nostr-message (ws message)
   "Handle Nostr message"
   (handler-case
-      (let ((msg (yason:parse message :object-as :alist)))
+      (progn
+        (when (> (length message) *max-message-length*)
+          (log:warn "~A message too large: ~A bytes" (ws-log-prefix ws) (length message))
+          (ws-send ws (encode-json-string
+                       (vector "NOTICE" (format nil "invalid: message too large (max ~A)" *max-message-length*))))
+          (return-from handle-nostr-message))
+        (let ((msg (yason:parse message :object-as :alist)))
         ;; Full payloads are large (REQ filters can hold hundreds of ids); keep
         ;; them at DEBUG so INFO stays a readable signal and rare WARN/ERROR
         ;; lines are not flushed out of the container log ring by the noise.
@@ -1277,11 +1320,26 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                        (filters (cddr msg)))
                    (log:info "Handling REQ: sub-id=~A filters=~A" sub-id (length filters))
                    (log:debug "REQ ~A filters=~A" sub-id filters)
-                   (handle-req ws sub-id filters))))
+                   (cond
+                     ((or (not (stringp sub-id))
+                          (> (length sub-id) *max-subid-length*))
+                      (ws-send ws (encode-json-string
+                                   (vector "CLOSED" (if (stringp sub-id) sub-id "")
+                                           (format nil "invalid: subscription id must be a string of at most ~A characters" *max-subid-length*)))))
+                     ((> (length filters) *max-filters*)
+                      (ws-send ws (encode-json-string
+                                   (vector "CLOSED" sub-id
+                                           (format nil "invalid: too many filters (max ~A)" *max-filters*)))))
+                     ((>= (ws-subscription-count ws sub-id) *max-subscriptions*)
+                      (ws-send ws (encode-json-string
+                                   (vector "CLOSED" sub-id
+                                           (format nil "error: too many subscriptions (max ~A)" *max-subscriptions*)))))
+                     (t
+                      (handle-req ws sub-id filters))))))
               ((equal type "CLOSE")
                (when (>= (length msg) 2)
                  (log:info "Handling CLOSE: sub-id=~A" (second msg))
-                 (handle-close (second msg) ws)))))))
+                 (handle-close (second msg) ws))))))))
     (error (e)
       (log:error "Error processing message: ~A" e))))
 
@@ -1386,14 +1444,14 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
                    (let ((limitation (make-hash-table :test 'equal)))
-                     (setf (gethash "max_message_length" limitation) 65536)
-                     (setf (gethash "max_subscriptions" limitation) 20)
-                     (setf (gethash "max_filters" limitation) 10)
+                     (setf (gethash "max_message_length" limitation) *max-message-length*)
+                     (setf (gethash "max_subscriptions" limitation) *max-subscriptions*)
+                     (setf (gethash "max_filters" limitation) *max-filters*)
                      (setf (gethash "max_limit" limitation) 500)
-                     (setf (gethash "max_subid_length" limitation) 100)
+                     (setf (gethash "max_subid_length" limitation) *max-subid-length*)
                      (setf (gethash "min_prefix" limitation) 4)
-                     (setf (gethash "max_event_tags" limitation) 2000)
-                     (setf (gethash "max_content_length" limitation) 65536)
+                     (setf (gethash "max_event_tags" limitation) *max-event-tags*)
+                     (setf (gethash "max_content_length" limitation) *max-content-length*)
                      (setf (gethash "min_pow_difficulty" limitation) 0)
                      (setf (gethash "auth_required" limitation) yason:false)
                      (setf (gethash "payment_required" limitation) yason:false)
