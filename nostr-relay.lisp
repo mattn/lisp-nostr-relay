@@ -776,7 +776,8 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         (param-counter 0)
         (max-limit 100))
     (dolist (filter filters)
-      (let ((kinds (event-field "kinds" filter))
+      (let ((ids (event-field "ids" filter))
+            (kinds (event-field "kinds" filter))
             (authors (event-field "authors" filter))
             (since (event-field "since" filter))
             (until (event-field "until" filter))
@@ -785,6 +786,18 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         (when limit
           (when (and (integerp limit) (> limit 0))
             (setf max-limit (min max-limit limit))))
+        (when ids
+          (if (listp ids)
+              (let ((placeholders nil))
+                (dolist (id ids)
+                  (incf param-counter)
+                  (push id all-params)
+                  (push (format nil "$~A" param-counter) placeholders))
+                (push (format nil "id IN (~{~A~^,~})" (reverse placeholders)) conditions))
+              (progn
+                (incf param-counter)
+                (push ids all-params)
+                (push (format nil "id = $~A" param-counter) conditions))))
         (when kinds
           (if (listp kinds)
               (let ((placeholders nil))
