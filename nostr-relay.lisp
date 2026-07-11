@@ -1159,10 +1159,47 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                    (equal (first tag) "-")))
             tags))))
 
+(defun validate-event-shape (event)
+  "Basic NIP-01 shape validation. Returns T, or NIL and a reason string.
+   Later handlers assume these types; without this check a malformed (but
+   consistently signed) event killed the handler with a type error and the
+   client never received an OK."
+  (let ((id (event-field "id" event))
+        (pubkey (event-field "pubkey" event))
+        (sig (event-field "sig" event))
+        (kind (event-field "kind" event))
+        (created-at (event-field "created_at" event))
+        (content (event-field "content" event))
+        (tags (event-field "tags" event)))
+    (cond
+      ((not (and (stringp id) (= (length id) 64) (hex-string-p id)))
+       (values nil "invalid: id must be a 64-character hex string"))
+      ((not (and (stringp pubkey) (= (length pubkey) 64) (hex-string-p pubkey)))
+       (values nil "invalid: pubkey must be a 64-character hex string"))
+      ((not (and (stringp sig) (= (length sig) 128) (hex-string-p sig)))
+       (values nil "invalid: sig must be a 128-character hex string"))
+      ((not (integerp kind))
+       (values nil "invalid: kind must be an integer"))
+      ((not (integerp created-at))
+       (values nil "invalid: created_at must be an integer"))
+      ((not (stringp content))
+       (values nil "invalid: content must be a string"))
+      ((not (or (null tags) (listp tags) (vectorp tags)))
+       (values nil "invalid: tags must be an array"))
+      (t t))))
+
 (defun handle-event (ws event-data)
   "Handle EVENT message"
   (let ((event event-data))
     (log:debug "Storing event: ~A" event)
+    ;; Reject malformed events up front with an OK false
+    (multiple-value-bind (valid reason) (validate-event-shape event)
+      (unless valid
+        (let ((event-id (let ((id (event-field "id" event)))
+                          (if (stringp id) id ""))))
+          (log:info "Rejecting malformed event ~S: ~A" event-id reason)
+          (ws-send ws (encode-json-string (vector "OK" event-id yason:false reason)))
+          (return-from handle-event))))
     ;; Enforce advertised NIP-11 limits
     (let ((content (event-field "content" event))
           (tags (event-field "tags" event))
