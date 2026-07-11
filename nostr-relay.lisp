@@ -1047,6 +1047,59 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                   (log:error "ERROR in tag processing: ~A" e))))))))))
 
 
+;; Request to vanish (NIP-62)
+(defun vanish-target-p (event)
+  "Check whether a kind 62 request to vanish targets this relay (NIP-62).
+   Matches a relay tag of ALL_RELAYS, or the RELAY_URL env var when set."
+  (let ((relay-url (or (uiop:getenv "RELAY_URL") ""))
+        (tags (event-field "tags" event)))
+    (when tags
+      (let ((tag-list (if (vectorp tags) (coerce tags 'list) tags)))
+        (some (lambda (tag)
+                (let ((tag-item (if (vectorp tag) (coerce tag 'list) tag)))
+                  (and (listp tag-item)
+                       (>= (length tag-item) 2)
+                       (equal (first tag-item) "relay")
+                       (let ((value (second tag-item)))
+                         (and (stringp value)
+                              (or (string= value "ALL_RELAYS")
+                                  (and (> (length relay-url) 0)
+                                       (string-equal value relay-url))))))))
+              tag-list)))))
+
+(defun handle-vanish-event (event)
+  "Handle kind 62 request to vanish (NIP-62): delete all events authored by
+   the pubkey up to the request's created_at, plus NIP-59 gift wraps that
+   p-tag the pubkey. Stored kind 62 requests are kept for bookkeeping and
+   re-broadcast prevention."
+  (when (vanish-target-p event)
+    (let ((pubkey (event-field "pubkey" event))
+          (created-at (event-field "created_at" event)))
+      (when (and (stringp pubkey) (integerp created-at))
+        (log:info "Vanish request (NIP-62): deleting events of ~A up to ~A" pubkey created-at)
+        (db-execute "DELETE FROM event WHERE pubkey = $1 AND created_at <= $2 AND kind <> 62"
+                    pubkey created-at)
+        (db-execute "DELETE FROM event WHERE kind = 1059 AND created_at <= $2
+                     AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) AS t
+                                 WHERE t->>0 = 'p' AND t->>1 = $1)"
+                    pubkey created-at)))))
+
+(defun vanished-pubkey-p (pubkey created-at)
+  "True when PUBKEY has a stored vanish request targeting this relay with
+   created_at >= CREATED-AT, so deleted events cannot be re-broadcast (NIP-62)."
+  (let ((relay-url (or (uiop:getenv "RELAY_URL") "")))
+    (handler-case
+        (not (null (db-query "SELECT 1 FROM event
+                              WHERE kind = 62 AND pubkey = $1 AND created_at >= $2
+                              AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) AS t
+                                          WHERE t->>0 = 'relay'
+                                          AND (t->>1 = 'ALL_RELAYS' OR t->>1 = $3))
+                              LIMIT 1"
+                             pubkey created-at relay-url)))
+      (error (e)
+        (log:error "Error checking vanish requests: ~A" e)
+        nil))))
+
 (defun get-expiration-timestamp (event)
   "Extract expiration timestamp from event tags (NIP-40)"
   (let ((tags (event-field "tags" event)))
@@ -1109,9 +1162,23 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
     ;; Verify event
     (if (verify-event event)
         (progn
+          ;; Refuse re-broadcast of vanished events (NIP-62)
+          (let ((kind (event-field "kind" event))
+                (pubkey (event-field "pubkey" event))
+                (created-at (event-field "created_at" event)))
+            (when (and (integerp kind) (/= kind 62)
+                       (stringp pubkey) (integerp created-at)
+                       (vanished-pubkey-p pubkey created-at))
+              (let ((event-id (event-field "id" event)))
+                (log:info "Rejecting event from vanished pubkey (NIP-62): ~A" event-id)
+                (ws-send ws (encode-json-string (vector "OK" event-id yason:false "blocked: pubkey requested to vanish (NIP-62)")))
+                (return-from handle-event))))
           ;; Handle deletion events (kind 5)
           (when (= (event-field "kind" event) 5)
             (handle-deletion-event event))
+          ;; Handle requests to vanish (kind 62, NIP-62)
+          (when (= (event-field "kind" event) 62)
+            (handle-vanish-event event))
           ;; Store event
           (store-event event)
           ;; Send OK response
