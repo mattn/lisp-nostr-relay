@@ -782,7 +782,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
   (let ((filter-conditions nil)
         (all-params nil)
         (param-counter 0)
-        (max-limit 100))
+        (requested-limit nil))
     (dolist (filter filters)
       (let ((ids (event-field "ids" filter))
             (kinds (event-field "kinds" filter))
@@ -791,9 +791,10 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
             (until (event-field "until" filter))
             (limit (event-field "limit" filter))
             (conditions nil))
-        (when limit
-          (when (and (integerp limit) (> limit 0))
-            (setf max-limit (min max-limit limit))))
+        ;; Filters are OR-ed together, so honor the largest requested limit
+        ;; (capped below) instead of letting one small filter starve the rest.
+        (when (and (integerp limit) (> limit 0))
+          (setf requested-limit (max (or requested-limit 0) limit)))
         (when ids
           (if (listp ids)
               (let ((placeholders nil))
@@ -856,9 +857,10 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                       (push (format nil "(~{~A~^ OR ~})" (reverse placeholders)) conditions))))))))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
-    ;; Add limit
+    ;; Add limit: default 100, requested limits honored up to the advertised
+    ;; NIP-11 max_limit of 500.
     (incf param-counter)
-    (push max-limit all-params)
+    (push (min 500 (or requested-limit 100)) all-params)
     (values filter-conditions (reverse all-params) param-counter)))
 
 (defun unregister-client (client)
