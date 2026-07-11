@@ -668,8 +668,13 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
 
             ;; Replaceable events: replace if newer
             ((is-replaceable kind)
+             ;; Only store when no newer event of the same pubkey/kind exists,
+             ;; otherwise an out-of-order older event would survive alongside
+             ;; the current one.
              (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
-                       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                       SELECT $1, $2, $3, $4, $5::jsonb, $6, $7
+                       WHERE NOT EXISTS (SELECT 1 FROM event
+                                         WHERE pubkey = $2 AND kind = $4 AND created_at > $3)
                        ON CONFLICT (id) DO NOTHING"
                       id pubkey created-at kind
                       (encode-json-string tags)
@@ -682,11 +687,14 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
             ((is-parameterized-replaceable kind)
              (let ((d-tag (get-d-tag tags)))
                (db-execute "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
-                         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                         SELECT $1, $2, $3, $4, $5::jsonb, $6, $7
+                         WHERE NOT EXISTS (SELECT 1 FROM event
+                                           WHERE pubkey = $2 AND kind = $4 AND created_at > $3
+                                           AND $8 = ANY(tagvalues))
                          ON CONFLICT (id) DO NOTHING"
                         id pubkey created-at kind
                         (encode-json-string tags)
-                        content sig)
+                        content sig d-tag)
                ;; Delete older events with same pubkey, kind, and d tag
                (db-execute "DELETE FROM event
                          WHERE pubkey = $1 AND kind = $2 AND created_at < $3
