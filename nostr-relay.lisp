@@ -1483,7 +1483,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                      (setf (gethash "relay_countries" info)
                            (coerce relay-countries 'vector)))
                    (setf (gethash "supported_nips" info)
-                         (vector 1 4 9 11 26 40 50 62 70 78))
+                         (vector 1 4 9 11 26 40 50 62 66 70 78))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
                    (let ((limitation (make-hash-table :test 'equal)))
