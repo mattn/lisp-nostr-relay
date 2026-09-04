@@ -810,7 +810,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                (write-char #\\ s))
              (write-char ch s))))
 
-(defun build-query (filters)
+(defun build-query (filters &optional count-only)
   "Build SQL query from filters with parameterized queries"
   (let ((filter-conditions nil)
         (all-params nil)
@@ -829,11 +829,11 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         ;; (capped below) instead of letting one small filter starve the rest.
         ;; A zero limit is an explicit request for no stored events.  It must
         ;; not be confused with an omitted limit, which uses the default.
-        (when (and (integerp limit) (>= limit 0))
+        (when (and (not count-only) (integerp limit) (>= limit 0))
           (setf requested-limit (max (or requested-limit 0) limit)))
         ;; Keep a zero-limit filter out of the historical OR query while
         ;; retaining it in the live subscription installed by HANDLE-REQ.
-        (when (and (integerp limit) (= limit 0))
+        (when (and (not count-only) (integerp limit) (= limit 0))
           (push "FALSE" conditions))
         (when ids
           (if (listp ids)
@@ -906,8 +906,9 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
     ;; Add limit: default 100, requested limits honored up to the advertised
     ;; NIP-11 max_limit of 500.
-    (incf param-counter)
-    (push (min 500 (or requested-limit 100)) all-params)
+    (unless count-only
+      (incf param-counter)
+      (push (min 500 (or requested-limit 100)) all-params))
     (values filter-conditions (reverse all-params) param-counter)))
 
 (defun unregister-client (client)
@@ -1012,6 +1013,38 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
     (error (e)
       (log:error "Error handling REQ: ~A" e)
       (ws-send ws (encode-json-string (vector "EOSE" subscription-id))))))
+
+(defun handle-count (ws query-id filters)
+  "Handle a NIP-45 COUNT request without creating a subscription."
+  (handler-case
+      (multiple-value-bind (conditions params ignored-param-count)
+          (build-query filters t)
+        (declare (ignore ignored-param-count))
+        (let* ((not-expired
+                 "NOT EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'expiration' AND tag->>1 ~ '^[0-9]+$' AND (tag->>1)::bigint <= EXTRACT(EPOCH FROM NOW())::bigint)")
+               (where-clause
+                 (if conditions
+                     (format nil "WHERE (~{~A~^ OR ~}) AND ~A" conditions not-expired)
+                     (format nil "WHERE ~A" not-expired)))
+               (sql (format nil "SELECT COUNT(*) FROM event ~A" where-clause))
+               (results
+                 (bordeaux-threads:with-lock-held (*db-query-lock*)
+                   (with-db-retry
+                     (progn
+                       (cl-postgres:prepare-query postmodern:*database* "" sql)
+                       (cl-postgres:exec-prepared postmodern:*database* "" params
+                                                  'cl-postgres:list-row-reader)))))
+               (count (if (and results (first results))
+                          (first (first results))
+                          0)))
+          (log:info "COUNT ~A result=~A" query-id count)
+          (let ((body (make-hash-table :test 'equal)))
+            (setf (gethash "count" body) count)
+            (ws-send ws (encode-json-string (vector "COUNT" query-id body))))))
+    (error (e)
+      (log:error "Error handling COUNT: ~A" e)
+      (ws-send ws (encode-json-string
+                   (vector "CLOSED" query-id "error: could not count events"))))))
 
 (defun handle-deletion-event (event)
   "Handle kind 5 deletion events (NIP-09)"
@@ -1379,6 +1412,22 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                                            (format nil "error: too many subscriptions (max ~A)" *max-subscriptions*)))))
                      (t
                       (handle-req ws sub-id filters))))))
+              ((equal type "COUNT")
+               (let ((query-id (second msg))
+                     (filters (cddr msg)))
+                 (log:info "Handling COUNT: query-id=~A filters=~A" query-id (length filters))
+                 (cond
+                   ((or (not (stringp query-id))
+                        (> (length query-id) *max-subid-length*))
+                    (ws-send ws (encode-json-string
+                                 (vector "CLOSED" (if (stringp query-id) query-id "")
+                                         (format nil "invalid: query id must be a string of at most ~A characters" *max-subid-length*)))))
+                   ((or (= (length filters) 0) (> (length filters) *max-filters*))
+                    (ws-send ws (encode-json-string
+                                 (vector "CLOSED" query-id
+                                         (format nil "invalid: filter count must be between 1 and ~A" *max-filters*)))))
+                   (t
+                    (handle-count ws query-id filters)))))
               ((equal type "CLOSE")
                (when (>= (length msg) 2)
                  (log:info "Handling CLOSE: sub-id=~A" (second msg))
@@ -1483,7 +1532,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                      (setf (gethash "relay_countries" info)
                            (coerce relay-countries 'vector)))
                    (setf (gethash "supported_nips" info)
-                         (vector 1 4 9 11 26 40 50 62 66 70 78))
+                         (vector 1 4 9 11 26 40 45 50 62 66 70 78))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
                    (let ((limitation (make-hash-table :test 'equal)))
