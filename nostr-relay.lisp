@@ -827,8 +827,14 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
             (conditions nil))
         ;; Filters are OR-ed together, so honor the largest requested limit
         ;; (capped below) instead of letting one small filter starve the rest.
-        (when (and (integerp limit) (> limit 0))
+        ;; A zero limit is an explicit request for no stored events.  It must
+        ;; not be confused with an omitted limit, which uses the default.
+        (when (and (integerp limit) (>= limit 0))
           (setf requested-limit (max (or requested-limit 0) limit)))
+        ;; Keep a zero-limit filter out of the historical OR query while
+        ;; retaining it in the live subscription installed by HANDLE-REQ.
+        (when (and (integerp limit) (= limit 0))
+          (push "FALSE" conditions))
         (when ids
           (if (listp ids)
               (let ((placeholders nil))
