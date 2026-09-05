@@ -330,6 +330,12 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
   (let* ((headers (getf env :headers))
          (peer (extract-client-ip env))
          (now (unix-time))
+         (challenge (ironclad:byte-array-to-hex-string
+                     (ironclad:random-data 32)))
+         (host (and headers (gethash "host" headers)))
+         (relay-url (or (uiop:getenv "RELAY_URL")
+                        (and host (concatenate 'string "wss://" host))
+                        ""))
          (meta (bordeaux-threads:with-lock-held (*ws-meta-lock*)
                  (let ((id (incf *next-ws-id*)))
                    (setf (gethash ws *ws-meta*)
@@ -339,7 +345,10 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                                :user-agent (and headers (gethash "user-agent" headers))
                                :connected-at now
                                :last-seen now
-                               :last-pong now))))))
+                               :last-pong now
+                               :challenge challenge
+                               :relay-url relay-url
+                               :authenticated-pubkeys nil))))))
     meta))
 
 (defun ws-meta (ws)
@@ -810,7 +819,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                (write-char #\\ s))
              (write-char ch s))))
 
-(defun build-query (filters &optional count-only)
+(defun build-query (filters ws &optional count-only)
   "Build SQL query from filters with parameterized queries"
   (let ((filter-conditions nil)
         (all-params nil)
@@ -902,6 +911,19 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                         (push tag-value all-params)
                         (push (format nil "$~A = ANY(tagvalues)" param-counter) placeholders))
                       (push (format nil "(~{~A~^ OR ~})" (reverse placeholders)) conditions))))))))
+        ;; NIP-17 gift wraps are only visible to pubkeys authenticated on this
+        ;; WebSocket connection (NIP-42).
+        (let ((pubkeys (getf (ws-meta ws) :authenticated-pubkeys)))
+          (if pubkeys
+              (let ((placeholders nil))
+                (dolist (pubkey pubkeys)
+                  (incf param-counter)
+                  (push pubkey all-params)
+                  (push (format nil "tag->>1 = $~A" param-counter) placeholders))
+                (push (format nil "(kind <> 1059 OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'p' AND (~{~A~^ OR ~})))"
+                              (reverse placeholders))
+                      conditions))
+              (push "kind <> 1059" conditions)))
         (when conditions
           (push (format nil "(~{~A~^ AND ~})" conditions) filter-conditions))))
     ;; Add limit: default 100, requested limits honored up to the advertised
@@ -933,7 +955,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
       (progn
         ;; Search from PostgreSQL
         (multiple-value-bind (conditions params limit-param-num)
-            (build-query filters)
+            (build-query filters ws)
           (let* ((where-clause (if conditions
                                    (format nil "WHERE ~{~A~^ OR ~}" conditions)
                                    ""))
@@ -1018,7 +1040,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
   "Handle a NIP-45 COUNT request without creating a subscription."
   (handler-case
       (multiple-value-bind (conditions params ignored-param-count)
-          (build-query filters t)
+          (build-query filters ws t)
         (declare (ignore ignored-param-count))
         (let* ((not-expired
                  "NOT EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'expiration' AND tag->>1 ~ '^[0-9]+$' AND (tag->>1)::bigint <= EXTRACT(EPOCH FROM NOW())::bigint)")
@@ -1198,6 +1220,62 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                    (equal (first tag) "-")))
             tags))))
 
+(defun normalize-relay-url (url)
+  (string-right-trim "/" (string-downcase url)))
+
+(defun event-has-tag-value-p (event name value)
+  (let ((tags (event-field "tags" event)))
+    (when tags
+      (some (lambda (tag)
+              (let ((items (if (vectorp tag) (coerce tag 'list) tag)))
+                (and (listp items) (>= (length items) 2)
+                     (equal (first items) name)
+                     (equal (second items) value))))
+            (if (vectorp tags) (coerce tags 'list) tags)))))
+
+(defun ws-authenticated-p (ws pubkey)
+  (and (stringp pubkey)
+       (member pubkey (getf (ws-meta ws) :authenticated-pubkeys)
+               :test #'string=)))
+
+(defun handle-auth (ws event)
+  "Authenticate a connection using a NIP-42 kind 22242 event."
+  (let* ((id (or (event-field "id" event) ""))
+         (pubkey (event-field "pubkey" event))
+         (created-at (event-field "created_at" event))
+         (meta (ws-meta ws))
+         (challenge (getf meta :challenge))
+         (relay-url (getf meta :relay-url)))
+    (labels ((reject (reason)
+               (ws-send ws (encode-json-string
+                            (vector "OK" id yason:false
+                                    (concatenate 'string "invalid: " reason))))))
+      (cond
+        ((/= (or (event-field "kind" event) -1) 22242)
+         (reject "authentication event must be kind 22242"))
+        ((or (not (integerp created-at))
+             (> (abs (- (unix-time) created-at)) 600))
+         (reject "authentication event timestamp is out of range"))
+        ((not (event-has-tag-value-p event "challenge" challenge))
+         (reject "authentication challenge does not match"))
+        ((not (some (lambda (tag)
+                      (let ((items (if (vectorp tag) (coerce tag 'list) tag)))
+                        (and (listp items) (>= (length items) 2)
+                             (equal (first items) "relay")
+                             (stringp (second items))
+                             (string= (normalize-relay-url (second items))
+                                      (normalize-relay-url relay-url)))))
+                    (let ((tags (event-field "tags" event)))
+                      (if (vectorp tags) (coerce tags 'list) tags))))
+         (reject "authentication relay does not match"))
+        ((not (verify-event event))
+         (reject "authentication signature verification failed"))
+        (t
+         (update-ws-meta ws :authenticated-pubkeys
+                         (adjoin pubkey (getf meta :authenticated-pubkeys)
+                                 :test #'string=))
+         (ws-send ws (encode-json-string (vector "OK" id t ""))))))))
+
 (defun validate-event-shape (event)
   "Basic NIP-01 shape validation. Returns T, or NIL and a reason string.
    Later handlers assume these types; without this check a malformed (but
@@ -1262,10 +1340,11 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         (ws-send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired (NIP-40)")))
         (return-from handle-event)))
     ;; Check for protected event (NIP-70)
-    (when (has-protected-tag event)
+    (when (and (has-protected-tag event)
+               (not (ws-authenticated-p ws (event-field "pubkey" event))))
       (let ((event-id (event-field "id" event)))
         (log:info "Rejecting protected event (NIP-70): ~A" event-id)
-        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "blocked: event contains '-' tag (NIP-70)")))
+        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "auth-required: protected event must be published by its authenticated author")))
         (return-from handle-event)))
     ;; Check delegation tag (NIP-26)
     (unless (validate-delegation event)
@@ -1319,6 +1398,10 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                              (let ((sub-ws (getf sub-info :ws))
                                    (filters (getf sub-info :filters)))
                                (when (and (eq (websocket-driver:ready-state sub-ws) :open)
+                                          (or (/= (event-field "kind" event) 1059)
+                                              (some (lambda (pubkey)
+                                                      (event-has-tag-value-p event "p" pubkey))
+                                                    (getf (ws-meta sub-ws) :authenticated-pubkeys)))
                                           (some (lambda (filter) (match-filter event filter)) filters))
                                  (push (list sub-id sub-ws) broadcast-targets)))))
                          *subscriptions*))
@@ -1390,6 +1473,9 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                (when (>= (length msg) 2)
                  (log:debug "Handling EVENT")
                  (handle-event ws (second msg))))
+              ((equal type "AUTH")
+               (when (>= (length msg) 2)
+                 (handle-auth ws (second msg))))
               ((equal type "REQ")
                (when (>= (length msg) 2)
                  (let ((sub-id (second msg))
@@ -1458,6 +1544,12 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                       (log:info "~A accepted connection total=~A"
                                 (ws-log-prefix ws)
                                 *connection-count*)
+                      (on :open ws
+                          (lambda ()
+                            (ws-send ws
+                                     (encode-json-string
+                                      (vector "AUTH"
+                                              (getf (ws-meta ws) :challenge))))))
                       (on :message ws
                           (lambda (message)
                             (handler-case
@@ -1532,7 +1624,7 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
                      (setf (gethash "relay_countries" info)
                            (coerce relay-countries 'vector)))
                    (setf (gethash "supported_nips" info)
-                         (vector 1 4 9 11 26 40 45 50 62 66 70 78))
+                         (vector 1 4 9 11 17 26 40 42 45 50 59 62 66 70 78))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
                    (let ((limitation (make-hash-table :test 'equal)))
