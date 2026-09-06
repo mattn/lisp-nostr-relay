@@ -260,7 +260,12 @@
       (db-execute "CREATE INDEX IF NOT EXISTS timeidx ON event (created_at DESC)")
       (db-execute "CREATE INDEX IF NOT EXISTS kindidx ON event (kind)")
       (db-execute "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC)")
-      (db-execute "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues)")))
+      (db-execute "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues)")
+      ;; NIP-50: search is a substring match, so a trigram index keeps the
+      ;; leading wildcard off a sequential scan. Terms shorter than 3
+      ;; characters produce no trigrams and still fall back to a scan.
+      (db-execute "CREATE EXTENSION IF NOT EXISTS pg_trgm")
+      (db-execute "CREATE INDEX IF NOT EXISTS contenttrgmidx ON event USING gin (content gin_trgm_ops)")))
 
 (defvar *subscriptions* (make-hash-table :test 'equal))
 (defvar *subscriptions-lock* (bordeaux-threads:make-lock "subscriptions"))
