@@ -17,7 +17,7 @@ ENV CLACK_HANDLER="hunchentoot"
 
 RUN sbcl --non-interactive \
     --load /app/nostr-relay.lisp \
-    --eval "(sb-ext:save-lisp-and-die \"/app/nostr-relay\" :toplevel #'nostr-relay:main :executable t :compression 9)" \
+    --eval "(sb-ext:save-lisp-and-die \"/app/nostr-relay\" :toplevel #'nostr-relay:main :executable t)" \
     --quit
 
 FROM alpine:latest
@@ -33,4 +33,9 @@ COPY --from=builder /app/nostr-relay /app/nostr-relay
 COPY --from=builder /app/public /app/public
 EXPOSE 5000
 
-ENTRYPOINT ["/app/nostr-relay"]
+# An uncompressed core is mapped straight from the file, so most of the image
+# stays file-backed instead of being decompressed into dirty anonymous pages.
+# SBCL also puts off collecting while the dynamic space has room, so capping it
+# keeps the heap from drifting up under load; 128MB was small enough to exhaust
+# the heap under concurrent queries, 256MB survived 120 parallel clients.
+ENTRYPOINT ["/app/nostr-relay", "--dynamic-space-size", "256MB", "--end-runtime-options"]
