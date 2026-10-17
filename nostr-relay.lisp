@@ -740,8 +740,22 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         (error (e)
           (log:error "Error storing event: ~A" e))))))
 
+(defun filter-has-empty-list-p (filter)
+  "True when FILTER has an empty ids/authors/kinds/#tag list.  NIP-01 says such
+a filter matches nothing; yason parses [] as NIL, so the key is present with a
+NIL value, unlike an omitted attribute."
+  (some (lambda (pair)
+          (and (consp pair)
+               (stringp (car pair))
+               (null (cdr pair))
+               (or (member (car pair) '("ids" "authors" "kinds") :test #'string=)
+                   (and (> (length (car pair)) 1) (char= (char (car pair) 0) #\#)))))
+        filter))
+
 (defun match-filter (event filter)
   "Check if event matches filter"
+  (when (filter-has-empty-list-p filter)
+    (return-from match-filter nil))
   (let ((event-id (event-field "id" event))
         (event-kind (event-field "kind" event))
         (event-pubkey (event-field "pubkey" event))
@@ -848,6 +862,10 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
         ;; Keep a zero-limit filter out of the historical OR query while
         ;; retaining it in the live subscription installed by HANDLE-REQ.
         (when (and (not count-only) (integerp limit) (= limit 0))
+          (push "FALSE" conditions))
+        ;; NIP-01: an empty list can never be satisfied, so the filter matches
+        ;; nothing instead of acting as if the attribute were absent.
+        (when (filter-has-empty-list-p filter)
           (push "FALSE" conditions))
         (when ids
           (if (listp ids)
