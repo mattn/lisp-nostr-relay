@@ -926,14 +926,27 @@ NIL value, unlike an omitted attribute."
               (when (stringp key)
                 (when (and (> (length key) 1) (char= (char key 0) #\#))
                   (when (and value (listp value))
-                    ;; Values of one tag filter are alternatives (NIP-01): OR
-                    ;; them together, matching match-filter's behavior.
-                    (let ((placeholders nil))
-                      (dolist (tag-value value)
-                        (incf param-counter)
-                        (push tag-value all-params)
-                        (push (format nil "$~A = ANY(tagvalues)" param-counter) placeholders))
-                      (push (format nil "(~{~A~^ OR ~})" (reverse placeholders)) conditions))))))))
+                    ;; Values of one tag filter are alternatives (NIP-01), but
+                    ;; they must appear in a tag with this name, matching
+                    ;; match-filter's behavior. tagvalues holds the values of
+                    ;; every single-letter tag regardless of name, so it only
+                    ;; serves as an indexed prefilter.
+                    (let ((tag-name (subseq key 1))
+                          (placeholders nil))
+                      (incf param-counter)
+                      (push tag-name all-params)
+                      (let ((name-param param-counter))
+                        (dolist (tag-value value)
+                          (incf param-counter)
+                          (push tag-value all-params)
+                          (push (format nil "$~A" param-counter) placeholders))
+                        (setf placeholders (reverse placeholders))
+                        (push (format nil "(~AEXISTS (SELECT 1 FROM jsonb_array_elements(tags) t WHERE t->>0 = $~A AND t->>1 IN (~{~A~^, ~})))"
+                                      (if (= (length tag-name) 1)
+                                          (format nil "tagvalues && ARRAY[~{~A~^, ~}]::text[] AND " placeholders)
+                                          "")
+                                      name-param placeholders)
+                              conditions)))))))))
         ;; NIP-17 gift wraps are only visible to pubkeys authenticated on this
         ;; WebSocket connection (NIP-42).
         (let ((pubkeys (getf (ws-meta ws) :authenticated-pubkeys)))
