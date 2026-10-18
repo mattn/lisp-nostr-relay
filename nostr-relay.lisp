@@ -767,11 +767,11 @@ NIL value, unlike an omitted attribute."
         (filter-since (event-field "since" filter))
         (filter-until (event-field "until" filter))
         (filter-search (event-field "search" filter)))
-    ;; Check ids filter
+    ;; Check ids filter (exact match; NIP-01 no longer allows prefixes)
     (when (and filter-ids
                (not (some (lambda (fid)
                             (and (stringp fid) (stringp event-id)
-                                 (eql 0 (search fid event-id))))
+                                 (string= fid event-id)))
                           (if (listp filter-ids) filter-ids (list filter-ids)))))
       (return-from match-filter nil))
     ;; Check kinds filter
@@ -779,11 +779,11 @@ NIL value, unlike an omitted attribute."
                                          (if (listp filter-kinds) filter-kinds (list filter-kinds))
                                          :test #'equal)))
       (return-from match-filter nil))
-    ;; Check authors filter (prefix match)
+    ;; Check authors filter (exact match)
     (when (and filter-authors
                (not (some (lambda (author)
                             (and (stringp author) (stringp event-pubkey)
-                                 (eql 0 (search author event-pubkey))))
+                                 (string= author event-pubkey)))
                           (if (listp filter-authors) filter-authors (list filter-authors)))))
       (return-from match-filter nil))
     ;; Check since filter
