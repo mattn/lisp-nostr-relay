@@ -11,6 +11,7 @@ This relay supports the following Nostr Implementation Possibilities (NIPs):
 - **NIP-09**: Event deletion (kind 5)
 - **NIP-11**: Relay Information Document
 - **NIP-12**: Generic tag queries (#e, #p, etc)
+- **NIP-13**: Proof of Work (minimum difficulty via `MIN_POW_DIFFICULTY`)
 - **NIP-15**: Marketplace
 - **NIP-16**: Event Treatment (ephemeral events 20000-29999)
 - **NIP-20**: Command results (OK messages)
@@ -79,6 +80,7 @@ Set the following environment variables:
 
 - `DATABASE_URL`: PostgreSQL connection string (e.g., `postgres://user:pass@host:5432/dbname`)
 - Or use individual variables: `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`
+- `MIN_POW_DIFFICULTY`: Minimum proof of work difficulty (leading zero bits of the event id) required for events (NIP-13, default `0` = disabled)
 
 ## License
 
