@@ -298,6 +298,9 @@
 (defparameter *max-subid-length* 100)
 (defparameter *max-event-tags* 2000)
 (defparameter *max-content-length* 65536)
+;; Minimum proof of work (NIP-13) required on incoming events, in leading zero
+;; bits of the event id. Read from MIN_POW_DIFFICULTY at startup in MAIN.
+(defvar *min-pow-difficulty* 0)
 
 (defun unix-time ()
   "Return the current UNIX time in seconds."
@@ -561,6 +564,23 @@ proxy). Falls back to the peer address, or \"unknown\" when nothing is known."
     (error (e)
       (log:error "Event verification error: ~A" e)
       nil)))
+
+;; Proof of work (NIP-13)
+(defun count-leading-zero-bits (hex)
+  "Count the number of leading zero bits in a hex-encoded event id"
+  (let ((count 0))
+    (loop for ch across hex
+          for nibble = (digit-char-p ch 16)
+          do (cond
+               ((null nibble) (return))
+               ((zerop nibble) (incf count 4))
+               (t
+                (cond
+                  ((<= nibble 1) (incf count 3))
+                  ((<= nibble 3) (incf count 2))
+                  ((<= nibble 7) (incf count 1)))
+                (return))))
+    count))
 
 ;; Delegated event signing (NIP-26)
 (defun hex-string-p (string)
@@ -1391,6 +1411,17 @@ NIL value, unlike an omitted attribute."
     ;; Verify event
     (if (verify-event event)
         (progn
+          ;; Enforce proof of work (NIP-13)
+          (when (> *min-pow-difficulty* 0)
+            (let* ((event-id (event-field "id" event))
+                   (difficulty (count-leading-zero-bits event-id)))
+              (when (< difficulty *min-pow-difficulty*)
+                (log:info "Rejecting event with insufficient proof of work (NIP-13): ~A" event-id)
+                (ws-send ws (encode-json-string
+                             (vector "OK" event-id yason:false
+                                     (format nil "pow: difficulty ~A is less than ~A"
+                                             difficulty *min-pow-difficulty*))))
+                (return-from handle-event))))
           ;; Refuse re-broadcast of vanished events (NIP-62)
           (let ((kind (event-field "kind" event))
                 (pubkey (event-field "pubkey" event))
@@ -1660,7 +1691,7 @@ NIL value, unlike an omitted attribute."
                      (setf (gethash "relay_countries" info)
                            (coerce relay-countries 'vector)))
                    (setf (gethash "supported_nips" info)
-                         (vector 1 4 9 11 17 26 40 42 45 50 59 62 66 70 78))
+                         (vector 1 4 9 11 13 17 26 40 42 45 50 59 62 66 70 78))
                    (setf (gethash "software" info) "https://github.com/mattn/lisp-nostr-relay")
                    (setf (gethash "version" info) "1.0.0")
                    (let ((limitation (make-hash-table :test 'equal)))
@@ -1672,7 +1703,7 @@ NIL value, unlike an omitted attribute."
                      (setf (gethash "min_prefix" limitation) 4)
                      (setf (gethash "max_event_tags" limitation) *max-event-tags*)
                      (setf (gethash "max_content_length" limitation) *max-content-length*)
-                     (setf (gethash "min_pow_difficulty" limitation) 0)
+                     (setf (gethash "min_pow_difficulty" limitation) *min-pow-difficulty*)
                      (setf (gethash "auth_required" limitation) yason:false)
                      (setf (gethash "payment_required" limitation) yason:false)
                      (setf (gethash "limitation" info) limitation))
@@ -1776,6 +1807,8 @@ NIL value, unlike an omitted attribute."
   ;; Database initialization and server startup
   (configure-log-level)
   (log:info "Starting application")
+  (setf *min-pow-difficulty*
+        (or (parse-integer (or (uiop:getenv "MIN_POW_DIFFICULTY") "0") :junk-allowed t) 0))
   (initialize)
   (connect-db)
   (setf *public-path* (merge-pathnames "public/"
