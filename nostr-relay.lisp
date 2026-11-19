@@ -1613,10 +1613,16 @@ NIL value, unlike an omitted attribute."
                                 *connection-count*)
                       (on :open ws
                           (lambda ()
-                            (ws-send ws
-                                     (encode-json-string
-                                      (vector "AUTH"
-                                              (getf (ws-meta ws) :challenge))))))
+                            ;; The client may already be gone; a failed send
+                            ;; must not escape into the session below.
+                            (handler-case
+                                (ws-send ws
+                                         (encode-json-string
+                                          (vector "AUTH"
+                                                  (getf (ws-meta ws) :challenge))))
+                              (error (e)
+                                (log:warn "~A could not send AUTH challenge: ~A"
+                                          (ws-log-prefix ws) e)))))
                       (on :message ws
                           (lambda (message)
                             (handler-case
@@ -1662,7 +1668,17 @@ NIL value, unlike an omitted attribute."
                       (lambda (responder)
                         (declare (ignore responder))
                         (log:info "~A starting websocket session" (ws-log-prefix ws))
-                        (start-connection ws)))))
+                        ;; An error escaping here makes clack write a 500
+                        ;; response to the upgraded socket. When the peer is
+                        ;; gone that write fails outside any handler and the
+                        ;; disabled debugger ends the whole process.
+                        (handler-case (start-connection ws)
+                          (error (e)
+                            (log:warn "~A websocket session ended with error: ~A"
+                                      (ws-log-prefix ws) e)
+                            (ignore-errors
+                             (cleanup-ws-state ws :error
+                                               :details (princ-to-string e)))))))))
               ;; Normal HTTP request
               (cond
                 ;; NIP-11 relay information
@@ -1804,6 +1820,24 @@ NIL value, unlike an omitted attribute."
         (log:error "Error in heartbeat thread: ~A" e)))))
 
 (defun main ()
+  ;; With the debugger disabled, an unhandled error in any thread ends the
+  ;; process. Let a failing worker thread end alone instead, so one broken
+  ;; connection cannot take the relay down.
+  (setf sb-ext:*invoke-debugger-hook*
+        (lambda (condition hook)
+          (declare (ignore hook))
+          (cond
+            ((sb-thread:main-thread-p)
+             (ignore-errors
+              (format *error-output* "Unhandled ~A: ~A~%" (type-of condition) condition))
+             (sb-ext:exit :code 1 :abort t))
+            (t
+             (ignore-errors
+              (log:error "Unhandled ~A in thread ~A: ~A"
+                         (type-of condition)
+                         (sb-thread:thread-name sb-thread:*current-thread*)
+                         condition))
+             (sb-thread:abort-thread)))))
   ;; Database initialization and server startup
   (configure-log-level)
   (log:info "Starting application")
