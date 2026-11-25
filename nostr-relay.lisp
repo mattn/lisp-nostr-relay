@@ -1393,7 +1393,7 @@ NIL value, unlike an omitted attribute."
     (when (is-expired event)
       (let ((event-id (event-field "id" event)))
         (log:info "Rejecting expired event (NIP-40): ~A" event-id)
-        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired (NIP-40)")))
+        (ws-send ws (encode-json-string (vector "OK" event-id yason:false "invalid: event has expired")))
         (return-from handle-event)))
     ;; Check for protected event (NIP-70)
     (when (and (has-protected-tag event)
